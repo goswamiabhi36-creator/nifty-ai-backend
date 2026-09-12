@@ -1,3 +1,26 @@
+from fastapi import FastAPI
+from datetime import datetime
+import requests
+
+app = FastAPI(title="NIFTY AI Backend")
+
+
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "service": "NIFTY AI Backend",
+        "time": datetime.now().isoformat()
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy"
+    }
+
+
 @app.get("/nifty")
 def nifty():
     url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
