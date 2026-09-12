@@ -25,5 +25,8 @@ def nifty():
     return {
         "symbol": "NIFTY 50",
         "price": 25000,
-        "status": "demo_data"
+        "change": 0,
+        "change_percent": 0,
+        "market_status": "demo",
+        "time": datetime.now().isoformat()
     }
