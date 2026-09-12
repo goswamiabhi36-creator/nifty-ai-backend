@@ -24,6 +24,6 @@ def health():
 def nifty():
     return {
         "symbol": "NIFTY 50",
-        "price": None,
-        "status": "waiting_for_live_data"
+        "price": 25000,
+        "status": "demo_data"
     }
