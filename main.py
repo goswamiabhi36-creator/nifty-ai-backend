@@ -4,10 +4,15 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 
-app = FastAPI(title="NIFTY AI Backend V2.3")
+app = FastAPI(title="NIFTY AI Backend V2.4")
 
+
+# =========================
+# YAHOO DATA
+# =========================
 
 def fetch_yahoo(range_value="1d", interval="5m"):
+
     url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI"
 
     params = {
@@ -21,16 +26,26 @@ def fetch_yahoo(range_value="1d", interval="5m"):
         "User-Agent": "Mozilla/5.0"
     }
 
-    r = requests.get(url, params=params, headers=headers, timeout=15)
+    r = requests.get(
+        url,
+        params=params,
+        headers=headers,
+        timeout=15
+    )
+
     r.raise_for_status()
 
-    data = r.json()["chart"]["result"][0]
+    result = r.json()["chart"]["result"][0]
 
-    timestamps = data.get("timestamp", [])
-    quote = data["indicators"]["quote"][0]
+    timestamps = result.get("timestamp", [])
+
+    quote = result["indicators"]["quote"][0]
 
     df = pd.DataFrame({
-        "time": pd.to_datetime(timestamps, unit="s"),
+        "time": pd.to_datetime(
+            timestamps,
+            unit="s"
+        ),
         "open": quote.get("open", []),
         "high": quote.get("high", []),
         "low": quote.get("low", []),
@@ -38,45 +53,86 @@ def fetch_yahoo(range_value="1d", interval="5m"):
         "volume": quote.get("volume", [])
     })
 
-    df = df.dropna(subset=["close"]).reset_index(drop=True)
+    df = df.dropna(
+        subset=["close"]
+    ).reset_index(drop=True)
 
-    return df, data.get("meta", {})
+    return df, result.get("meta", {})
 
+
+# =========================
+# RSI
+# =========================
 
 def rsi(series, period=14):
+
     delta = series.diff()
 
     gain = delta.clip(lower=0)
+
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.rolling(period).mean()
+
     avg_loss = loss.rolling(period).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
 
-    return 100 - (100 / (1 + rs))
+    return 100 - (
+        100 / (1 + rs)
+    )
 
+
+# =========================
+# MACD
+# =========================
 
 def calculate_macd(series):
-    ema12 = series.ewm(span=12, adjust=False).mean()
-    ema26 = series.ewm(span=26, adjust=False).mean()
+
+    ema12 = series.ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    ema26 = series.ewm(
+        span=26,
+        adjust=False
+    ).mean()
 
     macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
+
+    signal = macd.ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
     histogram = macd - signal
 
-    return macd.iloc[-1], signal.iloc[-1], histogram.iloc[-1]
+    return (
+        macd.iloc[-1],
+        signal.iloc[-1],
+        histogram.iloc[-1]
+    )
 
+
+# =========================
+# TREND
+# =========================
 
 def trend_from_data(df):
+
     if len(df) < 20:
         return "UNKNOWN"
 
     close = df["close"]
 
     ma5 = close.rolling(5).mean().iloc[-1]
+
     ma10 = close.rolling(10).mean().iloc[-1]
+
     ma20 = close.rolling(20).mean().iloc[-1]
 
     price = close.iloc[-1]
@@ -90,31 +146,51 @@ def trend_from_data(df):
     return "SIDEWAYS"
 
 
+# =========================
+# ROUNDING
+# =========================
+
 def safe_round(value, digits=2):
+
     if value is None:
         return None
 
     try:
         return round(float(value), digits)
+
     except:
         return None
 
 
+# =========================
+# HOME
+# =========================
+
 @app.get("/")
 def home():
+
     return {
         "status": "NIFTY AI backend running",
-        "version": "V2.3"
+        "version": "V2.4"
     }
 
+
+# =========================
+# HEALTH
+# =========================
 
 @app.get("/health")
 def health():
+
     return {
         "status": "ok",
-        "version": "V2.3"
+        "version": "V2.4"
     }
 
+
+# =========================
+# NIFTY ANALYSIS
+# =========================
 
 @app.get("/nifty")
 def nifty_analysis():
@@ -122,298 +198,749 @@ def nifty_analysis():
     try:
 
         # --------------------------------
-        # CURRENT INTRADAY DATA
+        # CURRENT 5 MINUTE DATA
         # --------------------------------
 
-        df, meta = fetch_yahoo("1d", "5m")
+        df, meta = fetch_yahoo(
+            "1d",
+            "5m"
+        )
 
-        if len(df) < 20:
+        if len(df) < 30:
+
             return {
-                "error": "Not enough market data"
+                "error": "Not enough market data",
+                "analysis_version": "V2.4"
             }
+
 
         close = df["close"]
 
-        price = float(close.iloc[-1])
-
-        previous_close = meta.get("previousClose")
-
-        if previous_close is None:
-            previous_close = float(close.iloc[0])
-
-        change = price - float(previous_close)
-
-        change_percent = (
-            change / float(previous_close) * 100
+        price = float(
+            close.iloc[-1]
         )
 
-        # --------------------------------
-        # INDICATORS
-        # --------------------------------
-
-        ma5 = close.rolling(5).mean().iloc[-1]
-        ma10 = close.rolling(10).mean().iloc[-1]
-        ma20 = close.rolling(20).mean().iloc[-1]
-
-        rsi14 = rsi(close, 14).iloc[-1]
-
-        macd, macd_signal, macd_hist = calculate_macd(close)
-
-        momentum = price - close.iloc[-6] if len(close) >= 6 else 0
 
         # --------------------------------
+        # PREVIOUS CLOSE
+        # --------------------------------
+
+        previous_close = meta.get(
+            "previousClose"
+        )
+
+        if previous_close is None:
+
+            previous_close = float(
+                close.iloc[0]
+            )
+
+        previous_close = float(
+            previous_close
+        )
+
+        change = (
+            price -
+            previous_close
+        )
+
+        change_percent = (
+            change /
+            previous_close *
+            100
+        )
+
+
+        # --------------------------------
+        # MOVING AVERAGES
+        # --------------------------------
+
+        ma5 = close.rolling(
+            5
+        ).mean().iloc[-1]
+
+        ma10 = close.rolling(
+            10
+        ).mean().iloc[-1]
+
+        ma20 = close.rolling(
+            20
+        ).mean().iloc[-1]
+
+
+        # --------------------------------
+        # RSI
+        # --------------------------------
+
+        rsi14 = rsi(
+            close,
+            14
+        ).iloc[-1]
+
+
+        # --------------------------------
+        # MACD
+        # --------------------------------
+
+        macd, macd_signal, macd_hist = (
+            calculate_macd(close)
+        )
+
+
+        # --------------------------------
+        # MOMENTUM
+        # --------------------------------
+
+        if len(df) >= 6:
+
+            momentum = (
+                price -
+                float(close.iloc[-6])
+            )
+
+        else:
+
+            momentum = 0
+
+
+        # =================================
         # SUPPORT / RESISTANCE
-        # --------------------------------
+        # =================================
 
-        recent = df.tail(min(30, len(df)))
+        # Current candle is excluded.
+        # This prevents the current candle
+        # from artificially changing levels.
 
-        support = float(recent["low"].min())
-        resistance = float(recent["high"].max())
+        completed = df.iloc[:-1]
+
+        recent = completed.tail(
+            min(30, len(completed))
+        )
+
+        support = float(
+            recent["low"].min()
+        )
+
+        resistance = float(
+            recent["high"].max()
+        )
+
 
         support_distance = (
-            (price - support) / price * 100
+            (price - support)
+            / price *
+            100
         )
 
         resistance_distance = (
-            (resistance - price) / price * 100
+            (resistance - price)
+            / price *
+            100
         )
 
+
+        # =================================
+        # NEAR SUPPORT / RESISTANCE
+        # =================================
+
+        near_support = (
+            support_distance <= 0.15
+        )
+
+        near_resistance = (
+            resistance_distance <= 0.15
+        )
+
+
+        # =================================
+        # BREAKOUT / BREAKDOWN
+        # =================================
+
+        breakdown_confirmed = False
+
+        breakout_confirmed = False
+
+        false_breakdown = False
+
+        false_breakout = False
+
+
         # --------------------------------
+        # PREVIOUS TWO COMPLETED CANDLES
+        # --------------------------------
+
+        if len(df) >= 3:
+
+            candle1 = df.iloc[-3]
+
+            candle2 = df.iloc[-2]
+
+        else:
+
+            candle1 = None
+
+            candle2 = None
+
+
+        # --------------------------------
+        # BREAKDOWN
+        # --------------------------------
+
+        if candle2 is not None:
+
+            breakdown_percent = (
+                (support - price)
+                / support *
+                100
+            )
+
+            if price < support:
+
+                if breakdown_percent >= 0.10:
+
+                    candle_confirmation = (
+                        float(candle2["close"])
+                        < support
+                    )
+
+                    momentum_confirmation = (
+                        momentum < 0
+                    )
+
+                    macd_confirmation = (
+                        macd < macd_signal
+                    )
+
+                    volume_confirmation = True
+
+
+                    # Volume confirmation only
+                    # when usable volume exists.
+
+                    volume = df["volume"].dropna()
+
+                    if len(volume) >= 10:
+
+                        current_volume = (
+                            volume.iloc[-1]
+                        )
+
+                        avg_volume = (
+                            volume.tail(10)
+                            .mean()
+                        )
+
+                        if avg_volume > 0:
+
+                            volume_ratio = (
+                                current_volume /
+                                avg_volume
+                            )
+
+                            volume_confirmation = (
+                                volume_ratio >= 1.10
+                            )
+
+
+                    if (
+                        candle_confirmation
+                        and momentum_confirmation
+                        and macd_confirmation
+                        and volume_confirmation
+                    ):
+
+                        breakdown_confirmed = True
+
+                    elif (
+                        candle_confirmation
+                        and momentum_confirmation
+                        and macd_confirmation
+                    ):
+
+                        # Allow confirmation without
+                        # volume because NIFTY index
+                        # volume may be unavailable.
+
+                        breakdown_confirmed = True
+
+
+                elif price < support:
+
+                    false_breakdown = True
+
+
+        # --------------------------------
+        # BREAKOUT
+        # --------------------------------
+
+        if candle2 is not None:
+
+            breakout_percent = (
+                (price - resistance)
+                / resistance *
+                100
+            )
+
+            if price > resistance:
+
+                if breakout_percent >= 0.10:
+
+                    candle_confirmation = (
+                        float(candle2["close"])
+                        > resistance
+                    )
+
+                    momentum_confirmation = (
+                        momentum > 0
+                    )
+
+                    macd_confirmation = (
+                        macd > macd_signal
+                    )
+
+                    volume_confirmation = True
+
+
+                    volume = df["volume"].dropna()
+
+                    if len(volume) >= 10:
+
+                        current_volume = (
+                            volume.iloc[-1]
+                        )
+
+                        avg_volume = (
+                            volume.tail(10)
+                            .mean()
+                        )
+
+                        if avg_volume > 0:
+
+                            volume_ratio = (
+                                current_volume /
+                                avg_volume
+                            )
+
+                            volume_confirmation = (
+                                volume_ratio >= 1.10
+                            )
+
+
+                    if (
+                        candle_confirmation
+                        and momentum_confirmation
+                        and macd_confirmation
+                        and volume_confirmation
+                    ):
+
+                        breakout_confirmed = True
+
+                    elif (
+                        candle_confirmation
+                        and momentum_confirmation
+                        and macd_confirmation
+                    ):
+
+                        breakout_confirmed = True
+
+
+                elif price > resistance:
+
+                    false_breakout = True
+
+
+        # =================================
         # VOLUME
-        # --------------------------------
+        # =================================
 
         volume_status = "UNAVAILABLE"
 
-        if "volume" in df.columns:
+        volume_ratio = None
 
-            volume = df["volume"].dropna()
+        volume = df["volume"].dropna()
 
-            if len(volume) >= 10:
+        if len(volume) >= 10:
 
-                current_volume = volume.iloc[-1]
-                avg_volume = volume.tail(10).mean()
+            current_volume = volume.iloc[-1]
 
-                if avg_volume > 0:
+            avg_volume = (
+                volume.tail(10)
+                .mean()
+            )
 
-                    ratio = current_volume / avg_volume
+            if avg_volume > 0:
 
-                    if ratio >= 1.5:
-                        volume_status = "HIGH"
+                volume_ratio = (
+                    current_volume /
+                    avg_volume
+                )
 
-                    elif ratio <= 0.7:
-                        volume_status = "LOW"
+                if volume_ratio >= 1.5:
 
-                    else:
-                        volume_status = "NORMAL"
+                    volume_status = "HIGH"
+
+                elif volume_ratio <= 0.7:
+
+                    volume_status = "LOW"
+
+                else:
+
+                    volume_status = "NORMAL"
+
+
+        # =================================
+        # HIGHER TIMEFRAME
+        # =================================
+
+        higher_tf_trend = "UNKNOWN"
+
+        higher_tf_warning = None
+
+        try:
+
+            df_15m, _ = fetch_yahoo(
+                "5d",
+                "15m"
+            )
+
+            higher_tf_trend = (
+                trend_from_data(df_15m)
+            )
+
+        except Exception:
+
+            higher_tf_warning = (
+                "Higher timeframe data unavailable"
+            )
+
+
+        # =================================
+        # SCORE ENGINE
+        # =================================
+
+        bullish_score = 0
+
+        bearish_score = 0
+
+        reasons = []
+
+
+        # --------------------------------
+        # SHORT TERM TREND
+        # --------------------------------
+
+        if price > ma5 > ma10:
+
+            bullish_score += 2
+
+            reasons.append(
+                "Bullish short-term trend"
+            )
+
+        elif price < ma5 < ma10:
+
+            bearish_score += 2
+
+            reasons.append(
+                "Bearish short-term trend"
+            )
+
 
         # --------------------------------
         # HIGHER TIMEFRAME
         # --------------------------------
 
-        higher_tf_trend = "UNKNOWN"
-        higher_tf_warning = None
+        if higher_tf_trend == "BULLISH":
 
-        try:
+            bullish_score += 2
 
-            df_15m, _ = fetch_yahoo("5d", "15m")
+            reasons.append(
+                "Higher timeframe bullish"
+            )
 
-            higher_tf_trend = trend_from_data(df_15m)
+        elif higher_tf_trend == "BEARISH":
 
-        except Exception:
+            bearish_score += 2
 
-            higher_tf_warning = "Higher timeframe data unavailable"
+            reasons.append(
+                "Higher timeframe bearish"
+            )
+
 
         # --------------------------------
-        # SCORE ENGINE
-        # --------------------------------
-
-        bullish_score = 0
-        bearish_score = 0
-
-        reasons = []
-
-        # Trend
-        if price < ma5 and ma5 < ma10:
-            bearish_score += 2
-            reasons.append("Bearish short-term trend")
-
-        elif price > ma5 and ma5 > ma10:
-            bullish_score += 2
-            reasons.append("Bullish short-term trend")
-
-        # Higher timeframe
-        if higher_tf_trend == "BEARISH":
-            bearish_score += 2
-            reasons.append("Higher timeframe bearish")
-
-        elif higher_tf_trend == "BULLISH":
-            bullish_score += 2
-            reasons.append("Higher timeframe bullish")
-
         # RSI
-        if rsi14 < 45:
-            bearish_score += 1
-            reasons.append("RSI bearish")
+        # --------------------------------
 
-        elif rsi14 > 55:
+        if rsi14 > 55:
+
             bullish_score += 1
-            reasons.append("RSI bullish")
 
-        # Momentum
-        if momentum < 0:
+            reasons.append(
+                "RSI bullish"
+            )
+
+        elif rsi14 < 45:
+
             bearish_score += 1
-            reasons.append("Negative momentum")
 
-        elif momentum > 0:
+            reasons.append(
+                "RSI bearish"
+            )
+
+
+        # --------------------------------
+        # MOMENTUM
+        # --------------------------------
+
+        if momentum > 0:
+
             bullish_score += 1
-            reasons.append("Positive momentum")
 
+            reasons.append(
+                "Positive momentum"
+            )
+
+        elif momentum < 0:
+
+            bearish_score += 1
+
+            reasons.append(
+                "Negative momentum"
+            )
+
+
+        # --------------------------------
         # MACD
-        if macd < macd_signal:
-            bearish_score += 1
-            reasons.append("MACD bearish")
+        # --------------------------------
 
-        elif macd > macd_signal:
+        if macd > macd_signal:
+
             bullish_score += 1
-            reasons.append("MACD bullish")
 
-        # --------------------------------
-        # SUPPORT BREAKDOWN FILTER
-        # --------------------------------
-
-        near_support = support_distance <= 0.15
-
-        breakdown_confirmed = False
-
-        if price < support:
-
-            breakdown_percent = (
-                (support - price) / support * 100
+            reasons.append(
+                "MACD bullish"
             )
 
-            if breakdown_percent >= 0.10:
+        elif macd < macd_signal:
 
-                if (
-                    momentum < 0
-                    and macd < macd_signal
-                ):
-                    breakdown_confirmed = True
+            bearish_score += 1
 
-        # --------------------------------
-        # RESISTANCE BREAKOUT FILTER
-        # --------------------------------
-
-        near_resistance = resistance_distance <= 0.15
-
-        breakout_confirmed = False
-
-        if price > resistance:
-
-            breakout_percent = (
-                (price - resistance) / resistance * 100
+            reasons.append(
+                "MACD bearish"
             )
 
-            if breakout_percent >= 0.10:
 
-                if (
-                    momentum > 0
-                    and macd > macd_signal
-                ):
-                    breakout_confirmed = True
-
-        # --------------------------------
-        # SIGNAL ENGINE V2.3
-        # --------------------------------
+        # =================================
+        # SIGNAL ENGINE
+        # =================================
 
         signal = "NEUTRAL"
+
         signal_strength = "LOW"
 
-        warnings = []
 
-        # IMPORTANT:
-        # Don't aggressively SELL directly above support
+        # --------------------------------
+        # CONFIRMED BREAKDOWN
+        # --------------------------------
 
-        if near_support and not breakdown_confirmed:
+        if breakdown_confirmed:
 
-            signal = "WAIT"
+            signal = "STRONG SELL"
+
             signal_strength = "HIGH"
 
-            warnings.append(
-                "Price near support - wait for breakdown confirmation"
+            reasons.append(
+                "Confirmed support breakdown"
             )
 
-        elif near_resistance and not breakout_confirmed:
 
-            signal = "WAIT"
+        # --------------------------------
+        # CONFIRMED BREAKOUT
+        # --------------------------------
+
+        elif breakout_confirmed:
+
+            signal = "STRONG BUY"
+
             signal_strength = "HIGH"
 
-            warnings.append(
-                "Price near resistance - wait for breakout confirmation"
+            reasons.append(
+                "Confirmed resistance breakout"
             )
+
+
+        # --------------------------------
+        # FALSE BREAKOUT / BREAKDOWN
+        # --------------------------------
+
+        elif false_breakdown:
+
+            signal = "WAIT"
+
+            signal_strength = "HIGH"
+
+            reasons.append(
+                "Possible false breakdown"
+            )
+
+
+        elif false_breakout:
+
+            signal = "WAIT"
+
+            signal_strength = "HIGH"
+
+            reasons.append(
+                "Possible false breakout"
+            )
+
+
+        # --------------------------------
+        # NEAR SUPPORT
+        # --------------------------------
+
+        elif near_support:
+
+            signal = "WAIT"
+
+            signal_strength = "HIGH"
+
+            reasons.append(
+                "Price near support - "
+                "wait for breakdown confirmation"
+            )
+
+
+        # --------------------------------
+        # NEAR RESISTANCE
+        # --------------------------------
+
+        elif near_resistance:
+
+            signal = "WAIT"
+
+            signal_strength = "HIGH"
+
+            reasons.append(
+                "Price near resistance - "
+                "wait for breakout confirmation"
+            )
+
+
+        # --------------------------------
+        # NORMAL SCORE SIGNAL
+        # --------------------------------
 
         else:
 
-            if bullish_score >= 7:
-                signal = "STRONG BUY"
-                signal_strength = "HIGH"
+            if bullish_score >= 6:
 
-            elif bullish_score >= 5:
                 signal = "BUY"
+
                 signal_strength = "MODERATE"
 
-            elif bearish_score >= 7:
 
-                if breakdown_confirmed:
-                    signal = "STRONG SELL"
-                    signal_strength = "HIGH"
-                else:
-                    signal = "SELL"
-                    signal_strength = "MODERATE"
+            elif bearish_score >= 6:
 
-            elif bearish_score >= 5:
+                signal = "SELL"
 
-                if breakdown_confirmed:
-                    signal = "SELL"
-                    signal_strength = "MODERATE"
-                else:
-                    signal = "WAIT"
-                    signal_strength = "HIGH"
+                signal_strength = "MODERATE"
+
 
             else:
+
                 signal = "NEUTRAL"
+
                 signal_strength = "LOW"
 
-        # --------------------------------
-        # CONFIDENCE
-        # --------------------------------
 
-        total_score = bullish_score + bearish_score
+        # =================================
+        # CONFIDENCE
+        # =================================
+
+        total_score = (
+            bullish_score +
+            bearish_score
+        )
 
         if total_score > 0:
 
             confidence = (
-                max(bullish_score, bearish_score)
-                / total_score
+                max(
+                    bullish_score,
+                    bearish_score
+                )
+                /
+                total_score
             ) * 100
 
         else:
+
             confidence = 50
 
-        # Avoid fake 90-100% confidence
-        confidence = min(confidence, 85)
 
-        # WAIT should not look like a high-confidence trade
-        if signal == "WAIT":
-            confidence = min(confidence, 60)
+        # Avoid misleadingly high
+        # confidence for weak signals.
 
-        # --------------------------------
+        if signal == "NEUTRAL":
+
+            confidence = min(
+                confidence,
+                65
+            )
+
+        elif signal == "WAIT":
+
+            confidence = min(
+                confidence,
+                70
+            )
+
+        elif signal in [
+            "BUY",
+            "SELL"
+        ]:
+
+            confidence = min(
+                confidence,
+                80
+            )
+
+        else:
+
+            confidence = min(
+                confidence,
+                90
+            )
+
+
+        # =================================
         # ENTRY / AVOID ZONES
-        # --------------------------------
+        # =================================
 
         entry_zone = None
+
         avoid_zone = None
 
-        if signal in ["BUY", "STRONG BUY"]:
+
+        if signal == "STRONG BUY":
+
+            entry_zone = [
+                safe_round(resistance),
+                safe_round(
+                    resistance * 1.002
+                )
+            ]
+
+            avoid_zone = [
+                safe_round(support),
+                safe_round(
+                    support * 0.998
+                )
+            ]
+
+
+        elif signal == "BUY":
 
             entry_zone = [
                 safe_round(price),
@@ -422,20 +949,45 @@ def nifty_analysis():
 
             avoid_zone = [
                 safe_round(support),
-                safe_round(support * 0.998)
+                safe_round(
+                    support * 0.998
+                )
             ]
 
-        elif signal in ["SELL", "STRONG SELL"]:
+
+        elif signal == "STRONG SELL":
 
             entry_zone = [
-                safe_round(support * 0.999),
-                safe_round(support * 0.995)
+                safe_round(
+                    support * 0.998
+                ),
+                safe_round(
+                    support * 0.995
+                )
             ]
 
             avoid_zone = [
                 safe_round(price),
                 safe_round(resistance)
             ]
+
+
+        elif signal == "SELL":
+
+            entry_zone = [
+                safe_round(
+                    support * 0.999
+                ),
+                safe_round(
+                    support * 0.995
+                )
+            ]
+
+            avoid_zone = [
+                safe_round(price),
+                safe_round(resistance)
+            ]
+
 
         elif signal == "WAIT":
 
@@ -446,35 +998,48 @@ def nifty_analysis():
                 safe_round(resistance)
             ]
 
-        # --------------------------------
-        # MARKET STATUS
-        # --------------------------------
 
-        market_state = meta.get("marketState")
+        # =================================
+        # MARKET STATUS
+        # =================================
+
+        market_state = meta.get(
+            "marketState"
+        )
 
         if market_state == "REGULAR":
+
             market_status = "LIVE"
 
-        elif market_state in ["PRE", "POST"]:
-            market_status = market_state
+        elif market_state == "PRE":
+
+            market_status = "PRE"
+
+        elif market_state == "POST":
+
+            market_status = "POST"
 
         elif market_state == "CLOSED":
+
             market_status = "CLOSED"
 
         else:
+
             market_status = "UNKNOWN"
 
-        # --------------------------------
+
+        # =================================
         # VWAP
-        # --------------------------------
+        # =================================
 
         vwap = None
 
-        # Yahoo index data may not provide usable volume
         if (
             "volume" in df.columns
-            and df["volume"].notna().sum() > 0
-            and df["volume"].sum() > 0
+            and
+            df["volume"].notna().sum() > 0
+            and
+            df["volume"].sum() > 0
         ):
 
             typical_price = (
@@ -483,88 +1048,158 @@ def nifty_analysis():
                 df["close"]
             ) / 3
 
-            cumulative_volume = df["volume"].cumsum()
+            cumulative_volume = (
+                df["volume"].cumsum()
+            )
 
-            if cumulative_volume.iloc[-1] > 0:
+            if (
+                cumulative_volume.iloc[-1]
+                > 0
+            ):
 
                 vwap = (
-                    (typical_price * df["volume"]).cumsum()
-                    / cumulative_volume
+                    (
+                        typical_price *
+                        df["volume"]
+                    ).cumsum()
+                    /
+                    cumulative_volume
                 ).iloc[-1]
 
+
+        # =================================
+        # WARNINGS
+        # =================================
+
+        warnings = []
+
         if vwap is None:
+
             warnings.append(
                 "VWAP unavailable for NIFTY index"
             )
 
-        if higher_tf_warning:
-            warnings.append(higher_tf_warning)
+        if volume_status == "UNAVAILABLE":
 
-        # --------------------------------
+            warnings.append(
+                "Volume data unavailable"
+            )
+
+        if higher_tf_warning:
+
+            warnings.append(
+                higher_tf_warning
+            )
+
+
+        # =================================
+        # FINAL TREND
+        # =================================
+
+        if bullish_score > bearish_score:
+
+            final_trend = "BULLISH"
+
+        elif bearish_score > bullish_score:
+
+            final_trend = "BEARISH"
+
+        else:
+
+            final_trend = "SIDEWAYS"
+
+
+        # =================================
         # FINAL RESPONSE
-        # --------------------------------
+        # =================================
 
         return {
 
-            "symbol": "NIFTY 50",
+            "symbol":
+                "NIFTY 50",
 
-            "price": safe_round(price),
+            "price":
+                safe_round(price),
 
-            "previous_close": safe_round(previous_close),
+            "previous_close":
+                safe_round(previous_close),
 
-            "change": safe_round(change),
+            "change":
+                safe_round(change),
 
-            "change_percent": safe_round(change_percent),
+            "change_percent":
+                safe_round(
+                    change_percent
+                ),
 
-            "market_status": market_status,
+            "market_status":
+                market_status,
 
-            "trend": (
-                "BULLISH"
-                if bullish_score > bearish_score
-                else "BEARISH"
-                if bearish_score > bullish_score
-                else "SIDEWAYS"
-            ),
+            "trend":
+                final_trend,
 
-            "higher_timeframe_trend": higher_tf_trend,
+            "higher_timeframe_trend":
+                higher_tf_trend,
 
-            "signal": signal,
+            "signal":
+                signal,
 
-            "signal_strength": signal_strength,
+            "signal_strength":
+                signal_strength,
 
-            "confidence": safe_round(confidence),
+            "confidence":
+                safe_round(confidence),
 
-            "rsi_14": safe_round(rsi14),
+            "rsi_14":
+                safe_round(rsi14),
 
-            "ma_5": safe_round(ma5),
+            "ma_5":
+                safe_round(ma5),
 
-            "ma_10": safe_round(ma10),
+            "ma_10":
+                safe_round(ma10),
 
-            "ma_20": safe_round(ma20),
+            "ma_20":
+                safe_round(ma20),
 
-            "vwap": safe_round(vwap),
+            "vwap":
+                safe_round(vwap),
 
-            "macd": safe_round(macd),
+            "macd":
+                safe_round(macd),
 
-            "macd_signal": safe_round(macd_signal),
+            "macd_signal":
+                safe_round(macd_signal),
 
-            "macd_histogram": safe_round(macd_hist),
+            "macd_histogram":
+                safe_round(macd_hist),
 
-            "momentum": safe_round(momentum),
+            "momentum":
+                safe_round(momentum),
 
-            "support": safe_round(support),
+            "support":
+                safe_round(support),
 
-            "resistance": safe_round(resistance),
+            "resistance":
+                safe_round(resistance),
 
             "support_distance_percent":
-                safe_round(support_distance, 3),
+                safe_round(
+                    support_distance,
+                    3
+                ),
 
             "resistance_distance_percent":
-                safe_round(resistance_distance, 3),
+                safe_round(
+                    resistance_distance,
+                    3
+                ),
 
-            "near_support": near_support,
+            "near_support":
+                near_support,
 
-            "near_resistance": near_resistance,
+            "near_resistance":
+                near_resistance,
 
             "breakdown_confirmed":
                 breakdown_confirmed,
@@ -572,8 +1207,20 @@ def nifty_analysis():
             "breakout_confirmed":
                 breakout_confirmed,
 
+            "false_breakdown":
+                false_breakdown,
+
+            "false_breakout":
+                false_breakout,
+
             "volume_status":
                 volume_status,
+
+            "volume_ratio":
+                safe_round(
+                    volume_ratio,
+                    2
+                ),
 
             "bullish_score":
                 bullish_score,
@@ -594,15 +1241,22 @@ def nifty_analysis():
                 avoid_zone,
 
             "analysis_version":
-                "V2.3",
+                "V2.4",
 
             "time":
-                datetime.now(timezone.utc).isoformat()
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
         }
+
 
     except Exception as e:
 
         return {
-            "error": str(e),
-            "analysis_version": "V2.3"
+
+            "error":
+                str(e),
+
+            "analysis_version":
+                "V2.4"
         }
