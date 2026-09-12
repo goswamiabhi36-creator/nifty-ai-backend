@@ -1,6 +1,5 @@
 from fastapi import FastAPI
 from datetime import datetime
-import requests
 
 app = FastAPI(title="NIFTY AI Backend")
 
@@ -23,44 +22,16 @@ def health():
 
 @app.get("/nifty")
 def nifty():
-    url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/"
-    }
-
-    try:
-        session = requests.Session()
-
-        session.get(
-            "https://www.nseindia.com/",
-            headers=headers,
-            timeout=10
-        )
-
-        response = session.get(
-            url,
-            headers=headers,
-            timeout=10
-        )
-
-        if response.status_code != 200:
-            return {
-                "symbol": "NIFTY 50",
-                "price": None,
-                "status": "nse_error",
-                "http_status": response.status_code
-            }
-
-        data = response.json()
-        info = data["metadata"]
-
-        return {
-            "symbol": "NIFTY 50",
-            "price": info.get("last"),
+    return {
+        "symbol": "NIFTY 50",
+        "price": None,
+        "change": None,
+        "change_percent": None,
+        "market_status": "waiting_for_live_data",
+        "signal": "NEUTRAL",
+        "trend": "UNKNOWN",
+        "time": datetime.now().isoformat()
+    }            "price": info.get("last"),
             "change": info.get("change"),
             "change_percent": info.get("percentChange"),
             "market_status": "live",
