@@ -5,19 +5,29 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
+import threading
+import time
 
 
 # ============================================================
-# APP
+# NIFTY AI TRADER — FINAL BACKEND
+# Version: FINAL-1.0
+# Data Source: Yahoo Finance (^NSEI)
 # ============================================================
+
 
 app = FastAPI(
     title="NIFTY AI TRADER",
-    version="5.1"
+    version="FINAL-1.0"
 )
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,12 +43,14 @@ app.add_middleware(
 # ============================================================
 
 SYMBOL = "^NSEI"
+
 IST = ZoneInfo("Asia/Kolkata")
 
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
 
-MAX_LIVE_AGE_SECONDS = 90
+MAX_LIVE_AGE_SECONDS = 120
+
 
 INTERVAL_CONFIG = {
     "1m": "1d",
@@ -50,6 +62,50 @@ INTERVAL_CONFIG = {
 }
 
 
+# Cache lifetime in seconds
+CACHE_TTL = {
+    "1m": 10,
+    "5m": 10,
+    "15m": 30,
+    "30m": 60,
+    "1h": 120,
+    "1D": 300,
+}
+
+
+# ============================================================
+# MEMORY CACHE
+# ============================================================
+
+_cache = {}
+_cache_lock = threading.Lock()
+
+
+def cache_get(interval: str):
+    with _cache_lock:
+        item = _cache.get(interval)
+
+        if item is None:
+            return None
+
+        timestamp, dataframe = item
+
+        ttl = CACHE_TTL.get(interval, 30)
+
+        if time.time() - timestamp > ttl:
+            return None
+
+        return dataframe.copy()
+
+
+def cache_set(interval: str, dataframe: pd.DataFrame):
+    with _cache_lock:
+        _cache[interval] = (
+            time.time(),
+            dataframe.copy()
+        )
+
+
 # ============================================================
 # BASIC HELPERS
 # ============================================================
@@ -58,33 +114,69 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def safe_float(value, default=None):
+def safe_float(value, digits: int = 2):
     try:
         if value is None:
-            return default
+            return None
 
         value = float(value)
 
-        if np.isnan(value) or np.isinf(value):
-            return default
+        if not np.isfinite(value):
+            return None
+
+        return round(value, digits)
+
+    except Exception:
+        return None
+
+
+def safe_int(value):
+    try:
+        if value is None:
+            return None
+
+        value = int(value)
 
         return value
 
     except Exception:
-        return default
+        return None
 
 
-def round_value(value, digits=2):
-    value = safe_float(value)
+def clean_value(value):
+    """
+    Converts numpy/pandas values to JSON-safe Python values.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating,)):
+        if not np.isfinite(float(value)):
+            return None
+        return float(value)
+
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return value
+
+    return value
+
+
+def normalize_number(value):
+    value = clean_value(value)
 
     if value is None:
         return None
 
-    return round(value, digits)
+    return round(float(value), 2)
 
 
 # ============================================================
-# YFINANCE COLUMN NORMALIZATION
+# DATAFRAME NORMALIZATION
 # ============================================================
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -94,118 +186,138 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
-    # Handle MultiIndex columns from yfinance
+    # Handle Yahoo Finance MultiIndex columns
     if isinstance(df.columns, pd.MultiIndex):
 
         new_columns = []
 
-        for col in df.columns:
+        for column in df.columns:
 
-            found = None
+            if isinstance(column, tuple):
 
-            for part in col:
-                part = str(part).strip()
+                found = None
 
-                if part.lower() in [
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "adj close",
-                    "volume"
-                ]:
-                    found = part
-                    break
+                for part in column:
+                    text = str(part).strip()
 
-            if found is None:
-                found = str(col[0])
+                    if text.lower() in {
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "adj close",
+                        "volume"
+                    }:
+                        found = text
+                        break
 
-            new_columns.append(found)
+                if found:
+                    new_columns.append(found)
+                else:
+                    new_columns.append(str(column[0]))
+
+            else:
+                new_columns.append(str(column))
 
         df.columns = new_columns
 
-    else:
-        df.columns = [
-            str(c).strip()
-            for c in df.columns
-        ]
-
     rename_map = {}
 
-    for col in df.columns:
+    for column in df.columns:
 
-        lower = col.lower()
+        lower = str(column).strip().lower()
 
         if lower == "open":
-            rename_map[col] = "Open"
+            rename_map[column] = "Open"
 
         elif lower == "high":
-            rename_map[col] = "High"
+            rename_map[column] = "High"
 
         elif lower == "low":
-            rename_map[col] = "Low"
+            rename_map[column] = "Low"
 
         elif lower == "close":
-            rename_map[col] = "Close"
+            rename_map[column] = "Close"
 
-        elif lower in ["adj close", "adj_close"]:
-            rename_map[col] = "Adj Close"
+        elif lower == "adj close":
+            rename_map[column] = "Adj Close"
 
         elif lower == "volume":
-            rename_map[col] = "Volume"
+            rename_map[column] = "Volume"
 
     df = df.rename(columns=rename_map)
 
-    required = [
-        "Open",
-        "High",
-        "Low",
-        "Close"
-    ]
+    required = ["Open", "High", "Low", "Close"]
 
-    for col in required:
-        if col not in df.columns:
+    for column in required:
+
+        if column not in df.columns:
             return pd.DataFrame()
 
     if "Volume" not in df.columns:
         df["Volume"] = np.nan
 
-    for col in [
-        "Open",
-        "High",
-        "Low",
-        "Close",
-        "Volume"
-    ]:
-        df[col] = pd.to_numeric(
-            df[col],
+    for column in ["Open", "High", "Low", "Close", "Volume"]:
+
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce"
         )
 
     df = df.dropna(
-        subset=[
-            "Open",
-            "High",
-            "Low",
-            "Close"
-        ]
+        subset=["Open", "High", "Low", "Close"]
     )
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # ========================================================
+    # TIMEZONE NORMALIZATION
+    # ========================================================
+
+    try:
+
+        if df.index.tz is None:
+
+            df.index = df.index.tz_localize(
+                "UTC"
+            )
+
+        df.index = df.index.tz_convert(IST)
+
+    except Exception:
+
+        try:
+
+            df.index = pd.to_datetime(
+                df.index,
+                utc=True
+            ).tz_convert(IST)
+
+        except Exception:
+            pass
+
+    df = df.sort_index()
 
     return df
 
 
 # ============================================================
-# FETCH DATA
+# FETCH HISTORY
 # ============================================================
 
-def fetch_history(
-    interval: str = "5m"
-) -> pd.DataFrame:
+def fetch_history(interval: str) -> pd.DataFrame:
 
     if interval not in INTERVAL_CONFIG:
-        raise ValueError(
-            "Invalid interval. Use 1m, 5m, 15m, 30m, 1h or 1D."
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported interval: {interval}"
         )
+
+    cached = cache_get(interval)
+
+    if cached is not None:
+        return cached
 
     period = INTERVAL_CONFIG[interval]
 
@@ -220,28 +332,25 @@ def fetch_history(
             threads=False
         )
 
-        df = normalize_columns(df)
+    except Exception as exc:
 
-        if df.empty:
-            return pd.DataFrame()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Yahoo Finance data error: {str(exc)}"
+        )
 
-        # Make timezone consistent
-        try:
+    df = normalize_columns(df)
 
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC")
+    if df.empty:
 
-            df.index = df.index.tz_convert(IST)
+        raise HTTPException(
+            status_code=503,
+            detail=f"No market data available for interval {interval}"
+        )
 
-        except Exception:
-            pass
+    cache_set(interval, df)
 
-        df = df.sort_index()
-
-        return df
-
-    except Exception:
-        return pd.DataFrame()
+    return df.copy()
 
 
 # ============================================================
@@ -249,92 +358,121 @@ def fetch_history(
 # ============================================================
 
 def get_market_status(
-    latest_timestamp
+    latest_timestamp=None
 ):
 
-    now = now_ist()
+    current = now_ist()
 
-    if now.weekday() >= 5:
-        return "CLOSED"
+    current_time = current.time()
 
-    current_time = now.time()
+    weekday = current.weekday()
+
+    if weekday >= 5:
+
+        return {
+            "status": "CLOSED",
+            "message": "Market closed — weekend."
+        }
 
     if current_time < MARKET_OPEN:
-        return "CLOSED"
+
+        return {
+            "status": "PRE_MARKET",
+            "message": "Market has not opened yet."
+        }
 
     if current_time > MARKET_CLOSE:
-        return "CLOSED"
+
+        return {
+            "status": "CLOSED",
+            "message": "Market closed for today."
+        }
+
+    if latest_timestamp is None:
+
+        return {
+            "status": "UNKNOWN",
+            "message": "Latest market timestamp unavailable."
+        }
 
     try:
-
-        if latest_timestamp is None:
-            return "DELAYED"
 
         if latest_timestamp.tzinfo is None:
             latest_timestamp = latest_timestamp.replace(
                 tzinfo=IST
             )
 
-        latest_timestamp = latest_timestamp.astimezone(IST)
-
         age = (
-            now - latest_timestamp
+            current - latest_timestamp
         ).total_seconds()
 
         if age <= MAX_LIVE_AGE_SECONDS:
-            return "LIVE"
 
-        return "DELAYED"
+            return {
+                "status": "LIVE",
+                "message": "Latest market data available."
+            }
+
+        return {
+            "status": "DELAYED",
+            "message": "Latest market data is delayed."
+        }
 
     except Exception:
-        return "DELAYED"
+
+        return {
+            "status": "UNKNOWN",
+            "message": "Unable to determine market status."
+        }
 
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
-def calculate_indicators(df: pd.DataFrame):
+def calculate_indicators(
+    df: pd.DataFrame
+):
 
-    df = df.copy()
+    data = df.copy()
 
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
+    close = data["Close"]
+    high = data["High"]
+    low = data["Low"]
 
     # --------------------------------------------------------
-    # Moving averages
+    # Moving Averages
     # --------------------------------------------------------
 
-    df["MA5"] = close.rolling(5).mean()
-    df["MA10"] = close.rolling(10).mean()
-    df["MA20"] = close.rolling(20).mean()
+    data["MA5"] = close.rolling(5).mean()
+    data["MA10"] = close.rolling(10).mean()
+    data["MA20"] = close.rolling(20).mean()
 
     # --------------------------------------------------------
     # EMA
     # --------------------------------------------------------
 
-    df["EMA9"] = close.ewm(
+    data["EMA9"] = close.ewm(
         span=9,
         adjust=False
     ).mean()
 
-    df["EMA20"] = close.ewm(
+    data["EMA20"] = close.ewm(
         span=20,
         adjust=False
     ).mean()
 
-    df["EMA50"] = close.ewm(
+    data["EMA50"] = close.ewm(
         span=50,
         adjust=False
     ).mean()
 
-    df["EMA100"] = close.ewm(
+    data["EMA100"] = close.ewm(
         span=100,
         adjust=False
     ).mean()
 
-    df["EMA200"] = close.ewm(
+    data["EMA200"] = close.ewm(
         span=200,
         adjust=False
     ).mean()
@@ -358,9 +496,12 @@ def calculate_indicators(df: pd.DataFrame):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(
+        0,
+        np.nan
+    )
 
-    df["RSI14"] = 100 - (
+    data["RSI14"] = 100 - (
         100 / (1 + rs)
     )
 
@@ -378,23 +519,25 @@ def calculate_indicators(df: pd.DataFrame):
         adjust=False
     ).mean()
 
-    df["MACD"] = ema12 - ema26
+    data["MACD"] = ema12 - ema26
 
-    df["MACD_SIGNAL"] = df["MACD"].ewm(
+    data["MACD_SIGNAL"] = data["MACD"].ewm(
         span=9,
         adjust=False
     ).mean()
 
-    df["MACD_HIST"] = (
-        df["MACD"] -
-        df["MACD_SIGNAL"]
+    data["MACD_HIST"] = (
+        data["MACD"] -
+        data["MACD_SIGNAL"]
     )
 
     # --------------------------------------------------------
     # Momentum
     # --------------------------------------------------------
 
-    df["MOMENTUM"] = close.diff(10)
+    data["MOMENTUM"] = (
+        close - close.shift(10)
+    )
 
     # --------------------------------------------------------
     # ATR
@@ -411,12 +554,12 @@ def calculate_indicators(df: pd.DataFrame):
         axis=1
     ).max(axis=1)
 
-    df["ATR14"] = true_range.rolling(
+    data["ATR14"] = true_range.rolling(
         14
     ).mean()
 
     # --------------------------------------------------------
-    # ADX + DI
+    # ADX / DI
     # --------------------------------------------------------
 
     up_move = high.diff()
@@ -429,7 +572,7 @@ def calculate_indicators(df: pd.DataFrame):
             up_move,
             0
         ),
-        index=df.index
+        index=data.index
     )
 
     minus_dm = pd.Series(
@@ -439,21 +582,21 @@ def calculate_indicators(df: pd.DataFrame):
             down_move,
             0
         ),
-        index=df.index
+        index=data.index
     )
 
-    tr14 = true_range.rolling(14).sum()
+    atr_for_adx = true_range.rolling(14).mean()
 
     plus_di = (
         100 *
-        plus_dm.rolling(14).sum() /
-        tr14.replace(0, np.nan)
+        plus_dm.rolling(14).mean() /
+        atr_for_adx.replace(0, np.nan)
     )
 
     minus_di = (
         100 *
-        minus_dm.rolling(14).sum() /
-        tr14.replace(0, np.nan)
+        minus_dm.rolling(14).mean() /
+        atr_for_adx.replace(0, np.nan)
     )
 
     dx = (
@@ -465,45 +608,35 @@ def calculate_indicators(df: pd.DataFrame):
         )
     )
 
-    df["PLUS_DI14"] = plus_di
-    df["MINUS_DI14"] = minus_di
-
-    df["ADX14"] = dx.rolling(14).mean()
+    data["PLUS_DI"] = plus_di
+    data["MINUS_DI"] = minus_di
+    data["ADX14"] = dx.rolling(14).mean()
 
     # --------------------------------------------------------
     # VWAP
     # --------------------------------------------------------
 
-    volume = pd.to_numeric(
-        df["Volume"],
-        errors="coerce"
-    )
-
     typical_price = (
         high + low + close
     ) / 3
 
-    volume_valid = (
-        volume.notna() &
-        (volume > 0)
-    )
+    volume = data["Volume"]
 
-    if volume_valid.any():
+    if (
+        volume.notna().any() and
+        volume.fillna(0).sum() > 0
+    ):
 
-        cumulative_volume = volume.where(
-            volume_valid,
-            0
-        ).cumsum()
+        cumulative_volume = (
+            volume.fillna(0).cumsum()
+        )
 
         cumulative_pv = (
             typical_price *
-            volume.where(
-                volume_valid,
-                0
-            )
+            volume.fillna(0)
         ).cumsum()
 
-        df["VWAP"] = (
+        data["VWAP"] = (
             cumulative_pv /
             cumulative_volume.replace(
                 0,
@@ -513,76 +646,83 @@ def calculate_indicators(df: pd.DataFrame):
 
     else:
 
-        df["VWAP"] = np.nan
+        data["VWAP"] = np.nan
 
     # --------------------------------------------------------
     # Bollinger Bands
     # --------------------------------------------------------
 
-    bb_mid = close.rolling(20).mean()
+    bb_middle = close.rolling(20).mean()
     bb_std = close.rolling(20).std()
 
-    df["BB_MIDDLE"] = bb_mid
-    df["BB_UPPER"] = bb_mid + 2 * bb_std
-    df["BB_LOWER"] = bb_mid - 2 * bb_std
+    data["BB_MIDDLE"] = bb_middle
 
-    df["BB_WIDTH"] = (
+    data["BB_UPPER"] = (
+        bb_middle +
+        2 * bb_std
+    )
+
+    data["BB_LOWER"] = (
+        bb_middle -
+        2 * bb_std
+    )
+
+    data["BB_WIDTH"] = (
         (
-            df["BB_UPPER"] -
-            df["BB_LOWER"]
+            data["BB_UPPER"] -
+            data["BB_LOWER"]
         ) /
-        df["BB_MIDDLE"].replace(
+        bb_middle.replace(
             0,
             np.nan
         )
     )
 
-    return df
+    return data
 
 
 # ============================================================
 # SUPPORT / RESISTANCE
-# IMPORTANT:
-# CURRENT CANDLE IS EXCLUDED
 # ============================================================
 
-def calculate_support_resistance(df):
+def calculate_support_resistance(
+    df: pd.DataFrame
+):
 
     if len(df) < 20:
+
         return {
             "support": None,
-            "resistance": None,
             "support2": None,
+            "resistance": None,
             "resistance2": None
         }
 
-    # Exclude current candle.
-    # This fixes the old breakout calculation problem.
-    previous = df.iloc[:-1]
+    reference = df.iloc[:-1]
 
-    recent50 = previous.tail(50)
-    recent20 = previous.tail(20)
+    recent_20 = reference.tail(20)
+    recent_50 = reference.tail(50)
 
     support = safe_float(
-        recent50["Low"].min()
+        recent_20["Low"].min()
     )
 
     resistance = safe_float(
-        recent50["High"].max()
+        recent_20["High"].max()
     )
 
     support2 = safe_float(
-        recent20["Low"].min()
+        recent_50["Low"].min()
     )
 
     resistance2 = safe_float(
-        recent20["High"].max()
+        recent_50["High"].max()
     )
 
     return {
         "support": support,
-        "resistance": resistance,
         "support2": support2,
+        "resistance": resistance,
         "resistance2": resistance2
     }
 
@@ -593,84 +733,119 @@ def calculate_support_resistance(df):
 
 def get_previous_day_levels():
 
-    df = fetch_history("1D")
-
-    if df.empty or len(df) < 2:
-        return {
-            "previous_day_high": None,
-            "previous_day_low": None,
-            "previous_day_close": None,
-            "day_open": None
-        }
-
-    today = now_ist().date()
-
-    completed = df.copy()
-
-    try:
-        dates = completed.index.date
-
-        # Remove current day if present
-        mask = dates < today
-
-        if mask.any():
-            completed = completed.loc[mask]
-
-    except Exception:
-        pass
-
-    if len(completed) < 1:
-        return {
-            "previous_day_high": None,
-            "previous_day_low": None,
-            "previous_day_close": None,
-            "day_open": None
-        }
-
-    previous = completed.iloc[-1]
-
-    return {
-        "previous_day_high": safe_float(
-            previous["High"]
-        ),
-        "previous_day_low": safe_float(
-            previous["Low"]
-        ),
-        "previous_day_close": safe_float(
-            previous["Close"]
-        ),
-        "day_open": None
-    }
-
-
-# ============================================================
-# DAY OPEN
-# ============================================================
-
-def get_day_open(df):
-
-    if df.empty:
-        return None
-
     try:
 
-        latest_date = df.index[-1].date()
+        df = fetch_history("1D")
 
-        same_day = df[
-            df.index.date == latest_date
+        if df.empty:
+            return {
+                "high": None,
+                "low": None,
+                "close": None,
+                "date": None
+            }
+
+        dates = pd.Series(
+            df.index.date,
+            index=df.index
+        )
+
+        today = now_ist().date()
+
+        previous = df.loc[
+            dates < today
         ]
 
-        if not same_day.empty:
-            return safe_float(
-                same_day.iloc[0]["Open"]
-            )
+        if previous.empty:
+
+            previous = df.iloc[:-1]
+
+        if previous.empty:
+
+            return {
+                "high": None,
+                "low": None,
+                "close": None,
+                "date": None
+            }
+
+        row = previous.iloc[-1]
+
+        previous_date = previous.index[-1]
+
+        return {
+            "high": safe_float(row["High"]),
+            "low": safe_float(row["Low"]),
+            "close": safe_float(row["Close"]),
+            "date": previous_date.strftime("%Y-%m-%d")
+        }
 
     except Exception:
-        pass
 
-    return safe_float(
-        df.iloc[-1]["Open"]
-    )
+        return {
+            "high": None,
+            "low": None,
+            "close": None,
+            "date": None
+        }
+
+
+# ============================================================
+# DAY OPEN / HIGH / LOW
+# ============================================================
+
+def get_day_statistics(
+    df: pd.DataFrame
+):
+
+    if df.empty:
+
+        return {
+            "open": None,
+            "high": None,
+            "low": None
+        }
+
+    try:
+
+        today = now_ist().date()
+
+        dates = pd.Series(
+            df.index.date,
+            index=df.index
+        )
+
+        today_data = df.loc[
+            dates == today
+        ]
+
+        if today_data.empty:
+
+            return {
+                "open": None,
+                "high": None,
+                "low": None
+            }
+
+        return {
+            "open": safe_float(
+                today_data["Open"].iloc[0]
+            ),
+            "high": safe_float(
+                today_data["High"].max()
+            ),
+            "low": safe_float(
+                today_data["Low"].min()
+            )
+        }
+
+    except Exception:
+
+        return {
+            "open": None,
+            "high": None,
+            "low": None
+        }
 
 
 # ============================================================
@@ -688,99 +863,111 @@ def calculate_pivots(
         previous_low is None or
         previous_close is None
     ):
+
         return {
             "pivot": None,
-            "pivot_r1": None,
-            "pivot_s1": None,
-            "pivot_r2": None,
-            "pivot_s2": None
+            "r1": None,
+            "r2": None,
+            "s1": None,
+            "s2": None
         }
 
-    pivot = (
-        previous_high +
-        previous_low +
-        previous_close
-    ) / 3
+    try:
 
-    r1 = (
-        2 * pivot
-    ) - previous_low
+        h = float(previous_high)
+        l = float(previous_low)
+        c = float(previous_close)
 
-    s1 = (
-        2 * pivot
-    ) - previous_high
+        pivot = (
+            h + l + c
+        ) / 3
 
-    r2 = (
-        pivot +
-        previous_high -
-        previous_low
-    )
+        r1 = (
+            2 * pivot
+        ) - l
 
-    s2 = (
-        pivot -
-        previous_high +
-        previous_low
-    )
+        s1 = (
+            2 * pivot
+        ) - h
 
-    return {
-        "pivot": pivot,
-        "pivot_r1": r1,
-        "pivot_s1": s1,
-        "pivot_r2": r2,
-        "pivot_s2": s2
-    }
+        r2 = (
+            pivot + h - l
+        )
+
+        s2 = (
+            pivot - h + l
+        )
+
+        return {
+            "pivot": safe_float(pivot),
+            "r1": safe_float(r1),
+            "r2": safe_float(r2),
+            "s1": safe_float(s1),
+            "s2": safe_float(s2)
+        }
+
+    except Exception:
+
+        return {
+            "pivot": None,
+            "r1": None,
+            "r2": None,
+            "s1": None,
+            "s2": None
+        }
 
 
 # ============================================================
 # VOLUME ANALYSIS
 # ============================================================
 
-def calculate_volume_status(df):
+def calculate_volume_status(
+    df: pd.DataFrame
+):
 
-    if df.empty or "Volume" not in df.columns:
+    if (
+        "Volume" not in df.columns or
+        len(df) < 21
+    ):
+
         return {
             "status": "UNAVAILABLE",
             "ratio": None,
             "available": False
         }
 
-    volume = pd.to_numeric(
-        df["Volume"],
-        errors="coerce"
-    )
+    volume = df["Volume"]
 
-    valid = volume[
-        volume > 0
-    ].dropna()
+    if (
+        volume.isna().all() or
+        volume.fillna(0).sum() <= 0
+    ):
 
-    if len(valid) < 5:
         return {
             "status": "UNAVAILABLE",
             "ratio": None,
             "available": False
         }
 
-    latest = safe_float(
-        valid.iloc[-1]
-    )
+    current = volume.iloc[-1]
 
-    average = safe_float(
-        valid.iloc[:-1].tail(20).mean()
-    )
+    average = volume.iloc[-21:-1].mean()
 
-    if latest is None or average is None:
+    if (
+        average is None or
+        not np.isfinite(average) or
+        average <= 0
+    ):
+
         return {
             "status": "UNAVAILABLE",
             "ratio": None,
             "available": False
         }
 
-    ratio = latest / average if average > 0 else None
+    ratio = current / average
 
-    if ratio is None:
-        status = "UNAVAILABLE"
-
-    elif ratio >= 1.5:
+    if ratio >= 1.5:
         status = "HIGH"
 
     elif ratio <= 0.7:
@@ -791,7 +978,7 @@ def calculate_volume_status(df):
 
     return {
         "status": status,
-        "ratio": ratio,
+        "ratio": safe_float(ratio, 2),
         "available": True
     }
 
@@ -800,9 +987,11 @@ def calculate_volume_status(df):
 # MARKET STRUCTURE
 # ============================================================
 
-def calculate_market_structure(df):
+def calculate_market_structure(
+    df: pd.DataFrame
+):
 
-    if len(df) < 10:
+    if len(df) < 12:
         return "UNKNOWN"
 
     recent = df.tail(10)
@@ -810,21 +999,11 @@ def calculate_market_structure(df):
     first_half = recent.iloc[:5]
     second_half = recent.iloc[5:]
 
-    first_high = safe_float(
-        first_half["High"].max()
-    )
+    first_high = first_half["High"].max()
+    second_high = second_half["High"].max()
 
-    second_high = safe_float(
-        second_half["High"].max()
-    )
-
-    first_low = safe_float(
-        first_half["Low"].min()
-    )
-
-    second_low = safe_float(
-        second_half["Low"].min()
-    )
+    first_low = first_half["Low"].min()
+    second_low = second_half["Low"].min()
 
     if (
         second_high > first_high and
@@ -838,9 +1017,18 @@ def calculate_market_structure(df):
     ):
         return "LH_LL"
 
+    first_range = (
+        first_high - first_low
+    )
+
+    second_range = (
+        second_high - second_low
+    )
+
     if (
-        second_high > first_high and
-        second_low < first_low
+        first_range > 0 and
+        second_range >
+        first_range * 1.35
     ):
         return "EXPANSION"
 
@@ -851,140 +1039,156 @@ def calculate_market_structure(df):
 # CANDLE PATTERN
 # ============================================================
 
-def detect_candle_pattern(df):
+def detect_candle_pattern(
+    df: pd.DataFrame
+):
 
     if len(df) < 3:
         return "NONE"
 
+    prev = df.iloc[-2]
     current = df.iloc[-1]
-    previous = df.iloc[-2]
 
-    o = safe_float(current["Open"])
-    h = safe_float(current["High"])
-    l = safe_float(current["Low"])
-    c = safe_float(current["Close"])
+    prev_open = float(prev["Open"])
+    prev_close = float(prev["Close"])
 
-    po = safe_float(previous["Open"])
-    pc = safe_float(previous["Close"])
+    current_open = float(current["Open"])
+    current_close = float(current["Close"])
 
-    if None in [o, h, l, c, po, pc]:
+    current_high = float(current["High"])
+    current_low = float(current["Low"])
+
+    current_body = abs(
+        current_close -
+        current_open
+    )
+
+    current_range = (
+        current_high -
+        current_low
+    )
+
+    if current_range <= 0:
         return "NONE"
 
-    body = abs(c - o)
-    candle_range = h - l
-
-    if candle_range <= 0:
-        return "NONE"
-
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-
-    body_ratio = body / candle_range
-
+    # --------------------------------------------------------
     # Bullish engulfing
+    # --------------------------------------------------------
+
     if (
-        pc < po and
-        c > o and
-        o <= pc and
-        c >= po
+        prev_close < prev_open and
+        current_close > current_open and
+        current_open <= prev_close and
+        current_close >= prev_open
     ):
         return "BULLISH_ENGULFING"
 
+    # --------------------------------------------------------
     # Bearish engulfing
+    # --------------------------------------------------------
+
     if (
-        pc > po and
-        c < o and
-        o >= pc and
-        c <= po
+        prev_close > prev_open and
+        current_close < current_open and
+        current_open >= prev_close and
+        current_close <= prev_open
     ):
         return "BEARISH_ENGULFING"
 
+    upper_wick = (
+        current_high -
+        max(current_open, current_close)
+    )
+
+    lower_wick = (
+        min(current_open, current_close) -
+        current_low
+    )
+
+    # --------------------------------------------------------
     # Hammer
+    # --------------------------------------------------------
+
     if (
-        lower_wick >= body * 2 and
-        upper_wick <= body * 0.8 and
-        body_ratio <= 0.45
+        lower_wick >= current_body * 2 and
+        upper_wick <= current_body
     ):
         return "HAMMER"
 
+    # --------------------------------------------------------
     # Shooting star
+    # --------------------------------------------------------
+
     if (
-        upper_wick >= body * 2 and
-        lower_wick <= body * 0.8 and
-        body_ratio <= 0.45
+        upper_wick >= current_body * 2 and
+        lower_wick <= current_body
     ):
         return "SHOOTING_STAR"
 
-    # Strong bullish candle
-    if (
-        c > o and
-        body_ratio >= 0.65
-    ):
-        return "STRONG_BULLISH"
+    # --------------------------------------------------------
+    # Strong candle
+    # --------------------------------------------------------
 
-    # Strong bearish candle
     if (
-        c < o and
-        body_ratio >= 0.65
+        current_body >=
+        current_range * 0.70
     ):
-        return "STRONG_BEARISH"
+
+        if current_close > current_open:
+            return "STRONG_BULLISH"
+
+        if current_close < current_open:
+            return "STRONG_BEARISH"
 
     return "NONE"
 
 
 # ============================================================
-# VOLATILITY ANALYSIS
+# VOLATILITY
 # ============================================================
 
-def calculate_volatility(df):
+def calculate_volatility(
+    df: pd.DataFrame
+):
 
-    if len(df) < 30:
+    if len(df) < 35:
+
         return {
             "status": "UNKNOWN",
             "atr_percent": None,
-            "atr_ratio": None
+            "ratio": None
         }
 
-    close = safe_float(
-        df["Close"].iloc[-1]
+    atr = df["ATR14"].iloc[-1]
+    close = df["Close"].iloc[-1]
+
+    median_atr = (
+        df["ATR14"]
+        .iloc[-31:-1]
+        .median()
     )
 
-    atr = safe_float(
-        df["ATR14"].iloc[-1]
-    )
+    if (
+        atr is None or
+        close is None or
+        median_atr is None or
+        not np.isfinite(atr) or
+        not np.isfinite(close) or
+        not np.isfinite(median_atr) or
+        median_atr <= 0
+    ):
 
-    if close is None or atr is None:
         return {
             "status": "UNKNOWN",
             "atr_percent": None,
-            "atr_ratio": None
+            "ratio": None
         }
+
+    ratio = atr / median_atr
 
     atr_percent = (
         atr / close
     ) * 100
-
-    atr_series = df["ATR14"].dropna()
-
-    if len(atr_series) < 10:
-        return {
-            "status": "NORMAL",
-            "atr_percent": atr_percent,
-            "atr_ratio": None
-        }
-
-    median_atr = safe_float(
-        atr_series.tail(30).median()
-    )
-
-    if median_atr is None or median_atr <= 0:
-        return {
-            "status": "NORMAL",
-            "atr_percent": atr_percent,
-            "atr_ratio": None
-        }
-
-    ratio = atr / median_atr
 
     if ratio >= 1.35:
         status = "HIGH"
@@ -997,66 +1201,90 @@ def calculate_volatility(df):
 
     return {
         "status": status,
-        "atr_percent": atr_percent,
-        "atr_ratio": ratio
+        "atr_percent": safe_float(
+            atr_percent,
+            3
+        ),
+        "ratio": safe_float(
+            ratio,
+            2
+        )
     }
 
 
 # ============================================================
-# BOLLINGER ANALYSIS
+# BOLLINGER STATE
 # ============================================================
 
-def calculate_bollinger_state(df):
+def calculate_bollinger_state(
+    df: pd.DataFrame
+):
 
     if len(df) < 30:
+
         return {
             "squeeze": False,
-            "expansion": False
+            "expansion": False,
+            "state": "UNKNOWN"
         }
 
-    width = df["BB_WIDTH"].dropna()
+    current_width = df["BB_WIDTH"].iloc[-1]
 
-    if len(width) < 20:
+    median_width = (
+        df["BB_WIDTH"]
+        .iloc[-21:-1]
+        .median()
+    )
+
+    previous_width = (
+        df["BB_WIDTH"].iloc[-2]
+    )
+
+    if (
+        current_width is None or
+        median_width is None or
+        not np.isfinite(current_width) or
+        not np.isfinite(median_width) or
+        median_width <= 0
+    ):
+
         return {
             "squeeze": False,
-            "expansion": False
-        }
-
-    current = safe_float(
-        width.iloc[-1]
-    )
-
-    median_width = safe_float(
-        width.tail(20).median()
-    )
-
-    previous = safe_float(
-        width.iloc[-2]
-    )
-
-    if None in [
-        current,
-        median_width,
-        previous
-    ]:
-        return {
-            "squeeze": False,
-            "expansion": False
+            "expansion": False,
+            "state": "UNKNOWN"
         }
 
     squeeze = (
-        current <=
+        current_width <=
         median_width * 0.75
     )
 
-    expansion = (
-        current >=
-        previous * 1.15
-    )
+    expansion = False
+
+    if (
+        previous_width is not None and
+        np.isfinite(previous_width) and
+        previous_width > 0
+    ):
+
+        expansion = (
+            current_width >=
+            previous_width * 1.15
+        )
+
+    if expansion:
+        state = "EXPANSION"
+
+    elif squeeze:
+        state = "SQUEEZE"
+
+    else:
+        state = "NORMAL"
 
     return {
         "squeeze": bool(squeeze),
-        "expansion": bool(expansion)
+        "expansion": bool(expansion),
+        "state": state
     }
 
 
@@ -1064,36 +1292,30 @@ def calculate_bollinger_state(df):
 # TREND
 # ============================================================
 
-def calculate_trend(df):
+def calculate_trend(
+    df: pd.DataFrame
+):
 
     if len(df) < 50:
-        return "SIDEWAYS"
+        return "UNKNOWN"
 
-    latest = df.iloc[-1]
+    row = df.iloc[-1]
 
-    close = safe_float(
-        latest["Close"]
-    )
+    close = row["Close"]
+    ema9 = row["EMA9"]
+    ema20 = row["EMA20"]
+    ema50 = row["EMA50"]
 
-    ema9 = safe_float(
-        latest["EMA9"]
-    )
-
-    ema20 = safe_float(
-        latest["EMA20"]
-    )
-
-    ema50 = safe_float(
-        latest["EMA50"]
-    )
-
-    if None in [
-        close,
-        ema9,
-        ema20,
-        ema50
-    ]:
-        return "SIDEWAYS"
+    if any(
+        pd.isna(x)
+        for x in [
+            close,
+            ema9,
+            ema20,
+            ema50
+        ]
+    ):
+        return "UNKNOWN"
 
     if (
         close > ema20 and
@@ -1113,33 +1335,76 @@ def calculate_trend(df):
 
 
 # ============================================================
+# LONGER TREND USING EMA200
+# ============================================================
+
+def calculate_long_trend(
+    df: pd.DataFrame
+):
+
+    if len(df) < 100:
+        return "UNKNOWN"
+
+    row = df.iloc[-1]
+
+    close = row["Close"]
+    ema50 = row["EMA50"]
+    ema100 = row["EMA100"]
+    ema200 = row["EMA200"]
+
+    if any(
+        pd.isna(x)
+        for x in [
+            close,
+            ema50,
+            ema100,
+            ema200
+        ]
+    ):
+        return "UNKNOWN"
+
+    if (
+        close > ema50 and
+        ema50 > ema100 and
+        ema100 > ema200
+    ):
+        return "STRONG_BULLISH"
+
+    if (
+        close < ema50 and
+        ema50 < ema100 and
+        ema100 < ema200
+    ):
+        return "STRONG_BEARISH"
+
+    return "MIXED"
+
+
+# ============================================================
 # MARKET REGIME
 # ============================================================
 
-def calculate_market_regime(df):
+def calculate_market_regime(
+    df: pd.DataFrame
+):
 
-    if df.empty:
+    if len(df) < 50:
         return "UNKNOWN"
 
-    latest = df.iloc[-1]
+    row = df.iloc[-1]
 
-    adx = safe_float(
-        latest["ADX14"]
-    )
+    adx = row["ADX14"]
+    plus_di = row["PLUS_DI"]
+    minus_di = row["MINUS_DI"]
 
-    plus_di = safe_float(
-        latest["PLUS_DI14"]
-    )
-
-    minus_di = safe_float(
-        latest["MINUS_DI14"]
-    )
-
-    if None in [
-        adx,
-        plus_di,
-        minus_di
-    ]:
+    if any(
+        pd.isna(x)
+        for x in [
+            adx,
+            plus_di,
+            minus_di
+        ]
+    ):
         return "UNKNOWN"
 
     if adx >= 25:
@@ -1154,511 +1419,791 @@ def calculate_market_regime(df):
 
 
 # ============================================================
-# SIGNAL ENGINE V5.1
+# BREAKOUT / BREAKDOWN
 # ============================================================
 
-def generate_signal(
-    df,
-    market_status,
-    htf_trends,
-    sr,
-    volume_info,
-    market_structure,
-    candle_pattern,
-    volatility,
-    bollinger
+def detect_breakout(
+    df: pd.DataFrame,
+    sr: dict,
+    volume_info: dict
 ):
 
-    if df.empty:
+    if len(df) < 20:
+
         return {
-            "signal": "NEUTRAL",
-            "signal_strength": "LOW",
-            "confidence": 0,
-            "bullish_score": 0,
-            "bearish_score": 0,
-            "reasons": [],
-            "warnings": [
-                "No market data available."
-            ],
-            "signal_quality": "LOW",
-            "no_trade_reason": "No data"
+            "breakout_confirmed": False,
+            "breakdown_confirmed": False,
+            "breakout_level": None,
+            "breakdown_level": None,
+            "status": "NONE",
+            "strength": "NONE"
         }
 
-    latest = df.iloc[-1]
+    current = df.iloc[-1]
 
-    close = safe_float(
-        latest["Close"]
-    )
+    close = float(current["Close"])
+    high = float(current["High"])
+    low = float(current["Low"])
 
-    ema9 = safe_float(
-        latest["EMA9"]
-    )
-
-    ema20 = safe_float(
-        latest["EMA20"]
-    )
-
-    ema50 = safe_float(
-        latest["EMA50"]
-    )
-
-    rsi = safe_float(
-        latest["RSI14"]
-    )
-
-    macd = safe_float(
-        latest["MACD"]
-    )
-
-    macd_signal = safe_float(
-        latest["MACD_SIGNAL"]
-    )
-
-    momentum = safe_float(
-        latest["MOMENTUM"]
-    )
-
-    vwap = safe_float(
-        latest["VWAP"]
-    )
-
-    adx = safe_float(
-        latest["ADX14"]
-    )
-
-    plus_di = safe_float(
-        latest["PLUS_DI14"]
-    )
-
-    minus_di = safe_float(
-        latest["MINUS_DI14"]
-    )
-
-    bullish = 0
-    bearish = 0
-
-    reasons = []
-    warnings = []
-
-    bullish_confirmations = 0
-    bearish_confirmations = 0
-
-    # --------------------------------------------------------
-    # EMA 9 / 20
-    # --------------------------------------------------------
-
-    if ema9 is not None and ema20 is not None:
-
-        if ema9 > ema20:
-            bullish += 1
-            bullish_confirmations += 1
-            reasons.append(
-                "EMA9 above EMA20"
-            )
-
-        elif ema9 < ema20:
-            bearish += 1
-            bearish_confirmations += 1
-            reasons.append(
-                "EMA9 below EMA20"
-            )
-
-    # --------------------------------------------------------
-    # EMA 20 / 50
-    # --------------------------------------------------------
-
-    if ema20 is not None and ema50 is not None:
-
-        if ema20 > ema50:
-            bullish += 1
-            bullish_confirmations += 1
-            reasons.append(
-                "EMA20 above EMA50"
-            )
-
-        elif ema20 < ema50:
-            bearish += 1
-            bearish_confirmations += 1
-            reasons.append(
-                "EMA20 below EMA50"
-            )
-
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
-
-    if rsi is not None:
-
-        if rsi >= 55:
-            bullish += 1
-            bullish_confirmations += 1
-            reasons.append(
-                f"RSI bullish ({rsi:.1f})"
-            )
-
-        elif rsi <= 45:
-            bearish += 1
-            bearish_confirmations += 1
-            reasons.append(
-                f"RSI bearish ({rsi:.1f})"
-            )
-
-    # --------------------------------------------------------
-    # MACD
-    # --------------------------------------------------------
-
-    if (
-        macd is not None and
-        macd_signal is not None
-    ):
-
-        if macd > macd_signal:
-            bullish += 1
-            bullish_confirmations += 1
-            reasons.append(
-                "MACD bullish"
-            )
-
-        elif macd < macd_signal:
-            bearish += 1
-            bearish_confirmations += 1
-            reasons.append(
-                "MACD bearish"
-            )
-
-    # --------------------------------------------------------
-    # VWAP
-    # --------------------------------------------------------
-
-    if (
-        close is not None and
-        vwap is not None
-    ):
-
-        if close > vwap:
-            bullish += 1
-            bullish_confirmations += 1
-            reasons.append(
-                "Price above VWAP"
-            )
-
-        elif close < vwap:
-            bearish += 1
-            bearish_confirmations += 1
-            reasons.append(
-                "Price below VWAP"
-            )
-
-    # --------------------------------------------------------
-    # Momentum
-    # --------------------------------------------------------
-
-    if momentum is not None:
-
-        if momentum > 0:
-            bullish += 1
-            bullish_confirmations += 1
-
-        elif momentum < 0:
-            bearish += 1
-            bearish_confirmations += 1
-
-    # --------------------------------------------------------
-    # ADX + DI
-    # --------------------------------------------------------
-
-    strong_adx = (
-        adx is not None and
-        adx >= 25
-    )
-
-    if strong_adx:
-
-        if (
-            plus_di is not None and
-            minus_di is not None
-        ):
-
-            if plus_di > minus_di:
-                bullish += 2
-                bullish_confirmations += 2
-
-                reasons.append(
-                    f"+DI dominant with ADX {adx:.1f}"
-                )
-
-            elif minus_di > plus_di:
-                bearish += 2
-                bearish_confirmations += 2
-
-                reasons.append(
-                    f"-DI dominant with ADX {adx:.1f}"
-                )
-
-    else:
-
-        warnings.append(
-            "ADX below 25: trend strength is weak."
-        )
-
-    # --------------------------------------------------------
-    # MARKET STRUCTURE
-    # --------------------------------------------------------
-
-    if market_structure == "HH_HL":
-
-        bullish += 2
-        bullish_confirmations += 2
-
-        reasons.append(
-            "Higher High / Higher Low structure"
-        )
-
-    elif market_structure == "LH_LL":
-
-        bearish += 2
-        bearish_confirmations += 2
-
-        reasons.append(
-            "Lower High / Lower Low structure"
-        )
-
-    elif market_structure == "RANGE":
-
-        warnings.append(
-            "Market structure is range-bound."
-        )
-
-    # --------------------------------------------------------
-    # CANDLE CONFIRMATION
-    # --------------------------------------------------------
-
-    bullish_candles = [
-        "BULLISH_ENGULFING",
-        "HAMMER",
-        "STRONG_BULLISH"
-    ]
-
-    bearish_candles = [
-        "BEARISH_ENGULFING",
-        "SHOOTING_STAR",
-        "STRONG_BEARISH"
-    ]
-
-    if candle_pattern in bullish_candles:
-
-        bullish += 1
-        bullish_confirmations += 1
-
-        reasons.append(
-            f"Bullish candle: {candle_pattern}"
-        )
-
-    elif candle_pattern in bearish_candles:
-
-        bearish += 1
-        bearish_confirmations += 1
-
-        reasons.append(
-            f"Bearish candle: {candle_pattern}"
-        )
-
-    # --------------------------------------------------------
-    # BREAKOUT / BREAKDOWN
-    # --------------------------------------------------------
-
-    resistance = sr.get(
-        "resistance"
-    )
-
-    support = sr.get(
-        "support"
-    )
+    resistance = sr.get("resistance")
+    support = sr.get("support")
 
     breakout = False
     breakdown = False
 
-    if (
-        close is not None and
-        resistance is not None and
-        close > resistance
-    ):
+    breakout_level = None
+    breakdown_level = None
 
-        breakout = True
+    if resistance is not None:
 
-        bullish += 3
-        bullish_confirmations += 3
+        if close > resistance:
+            breakout = True
+            breakout_level = resistance
 
-        reasons.append(
-            "Resistance breakout"
-        )
+    if support is not None:
 
-    if (
-        close is not None and
-        support is not None and
-        close < support
-    ):
+        if close < support:
+            breakdown = True
+            breakdown_level = support
 
-        breakdown = True
+    volume_available = volume_info.get(
+        "available",
+        False
+    )
 
-        bearish += 3
-        bearish_confirmations += 3
+    volume_ratio = volume_info.get(
+        "ratio"
+    )
 
-        reasons.append(
-            "Support breakdown"
-        )
-
-    # --------------------------------------------------------
-    # BREAKOUT VOLUME CONFIRMATION
-    # --------------------------------------------------------
-
-    breakout_volume_confirmed = False
+    volume_confirmed = False
 
     if (
-        breakout or
-        breakdown
+        volume_available and
+        volume_ratio is not None and
+        volume_ratio >= 1.20
     ):
+        volume_confirmed = True
 
-        if volume_info.get("available"):
+    if breakout:
 
-            ratio = volume_info.get(
-                "ratio"
-            )
+        if volume_confirmed:
+            strength = "STRONG"
 
-            if ratio is not None and ratio >= 1.2:
-
-                breakout_volume_confirmed = True
-
-                if breakout:
-                    bullish += 2
-                    bullish_confirmations += 2
-
-                    reasons.append(
-                        "Breakout confirmed by volume"
-                    )
-
-                elif breakdown:
-                    bearish += 2
-                    bearish_confirmations += 2
-
-                    reasons.append(
-                        "Breakdown confirmed by volume"
-                    )
-
-            else:
-
-                warnings.append(
-                    "Breakout/breakdown lacks strong volume confirmation."
-                )
+        elif not volume_available:
+            strength = "PRICE_CONFIRMED"
 
         else:
+            strength = "WEAK"
 
-            warnings.append(
-                "Volume unavailable for NIFTY index."
-            )
+        return {
+            "breakout_confirmed": True,
+            "breakdown_confirmed": False,
+            "breakout_level": safe_float(
+                breakout_level
+            ),
+            "breakdown_level": None,
+            "status": "BREAKOUT",
+            "strength": strength
+        }
 
-    # --------------------------------------------------------
-    # HIGHER TIMEFRAME ALIGNMENT
-    # --------------------------------------------------------
+    if breakdown:
 
-    current_trend = calculate_trend(df)
+        if volume_confirmed:
+            strength = "STRONG"
 
-    trend_values = [
-        htf_trends.get("15m"),
-        htf_trends.get("30m"),
-        htf_trends.get("1h")
-    ]
+        elif not volume_available:
+            strength = "PRICE_CONFIRMED"
 
-    bullish_htf = sum(
-        1 for x in trend_values
-        if x == "BULLISH"
-    )
+        else:
+            strength = "WEAK"
 
-    bearish_htf = sum(
-        1 for x in trend_values
-        if x == "BEARISH"
-    )
+        return {
+            "breakout_confirmed": False,
+            "breakdown_confirmed": True,
+            "breakout_level": None,
+            "breakdown_level": safe_float(
+                breakdown_level
+            ),
+            "status": "BREAKDOWN",
+            "strength": strength
+        }
 
-    if bullish_htf >= 2:
+    return {
+        "breakout_confirmed": False,
+        "breakdown_confirmed": False,
+        "breakout_level": None,
+        "breakdown_level": None,
+        "status": "NONE",
+        "strength": "NONE"
+    }
 
-        bullish += 2
-        bullish_confirmations += 2
 
-        reasons.append(
-            "Higher timeframes support bullish direction"
+# ============================================================
+# FALSE BREAKOUT / BREAKDOWN
+# ============================================================
+
+def detect_false_breakout(
+    df: pd.DataFrame,
+    sr: dict
+):
+
+    if len(df) < 20:
+
+        return {
+            "false_breakout": False,
+            "false_breakdown": False,
+            "status": "NONE"
+        }
+
+    current = df.iloc[-1]
+
+    close = float(current["Close"])
+    high = float(current["High"])
+    low = float(current["Low"])
+
+    resistance = sr.get("resistance")
+    support = sr.get("support")
+
+    false_breakout = False
+    false_breakdown = False
+
+    if resistance is not None:
+
+        false_breakout = (
+            high > resistance and
+            close <= resistance
         )
 
-    elif bearish_htf >= 2:
+    if support is not None:
 
-        bearish += 2
-        bearish_confirmations += 2
-
-        reasons.append(
-            "Higher timeframes support bearish direction"
+        false_breakdown = (
+            low < support and
+            close >= support
         )
+
+    if false_breakout:
+
+        status = "FALSE_BREAKOUT"
+
+    elif false_breakdown:
+
+        status = "FALSE_BREAKDOWN"
 
     else:
 
-        warnings.append(
-            "Higher timeframe confirmation is mixed."
+        status = "NONE"
+
+    return {
+        "false_breakout": bool(false_breakout),
+        "false_breakdown": bool(false_breakdown),
+        "status": status
+    }
+
+
+# ============================================================
+# HIGHER TIMEFRAME ANALYSIS
+# ============================================================
+
+def get_higher_timeframe_analysis():
+
+    intervals = [
+        "15m",
+        "30m",
+        "1h",
+        "1D"
+    ]
+
+    result = {}
+
+    for interval in intervals:
+
+        try:
+
+            df = fetch_history(interval)
+
+            if df.empty:
+
+                result[interval] = {
+                    "trend": "UNKNOWN",
+                    "long_trend": "UNKNOWN"
+                }
+
+                continue
+
+            df = calculate_indicators(df)
+
+            result[interval] = {
+                "trend": calculate_trend(df),
+                "long_trend": calculate_long_trend(df),
+                "last_price": safe_float(
+                    df["Close"].iloc[-1]
+                )
+            }
+
+        except Exception:
+
+            result[interval] = {
+                "trend": "UNKNOWN",
+                "long_trend": "UNKNOWN",
+                "last_price": None
+            }
+
+    return result
+
+
+# ============================================================
+# MULTI-TIMEFRAME ALIGNMENT
+# ============================================================
+
+def calculate_mtf_alignment(
+    timeframe_data: dict
+):
+
+    trends = []
+
+    for interval in [
+        "15m",
+        "30m",
+        "1h",
+        "1D"
+    ]:
+
+        trend = (
+            timeframe_data
+            .get(interval, {})
+            .get("trend")
         )
 
-    # --------------------------------------------------------
-    # HTF CONFLICT
-    # --------------------------------------------------------
+        if trend in [
+            "BULLISH",
+            "BEARISH"
+        ]:
 
-    htf_conflict = (
-        bullish_htf >= 1 and
-        bearish_htf >= 1
+            trends.append(trend)
+
+    if len(trends) < 2:
+        return "INSUFFICIENT_DATA"
+
+    bullish = trends.count("BULLISH")
+    bearish = trends.count("BEARISH")
+
+    if bullish == len(trends):
+        return "FULL_BULLISH"
+
+    if bearish == len(trends):
+        return "FULL_BEARISH"
+
+    if bullish >= len(trends) * 0.75:
+        return "BULLISH_BIAS"
+
+    if bearish >= len(trends) * 0.75:
+        return "BEARISH_BIAS"
+
+    return "MIXED"
+
+
+# ============================================================
+# HTF CONFLICT
+# ============================================================
+
+def detect_htf_conflict(
+    timeframe_data: dict
+):
+
+    trends = []
+
+    for interval in [
+        "15m",
+        "30m",
+        "1h",
+        "1D"
+    ]:
+
+        trend = (
+            timeframe_data
+            .get(interval, {})
+            .get("trend")
+        )
+
+        if trend in [
+            "BULLISH",
+            "BEARISH"
+        ]:
+            trends.append(trend)
+
+    if not trends:
+        return False
+
+    bullish = trends.count("BULLISH")
+    bearish = trends.count("BEARISH")
+
+    return (
+        bullish > 0 and
+        bearish > 0
     )
 
-    if htf_conflict:
 
-        warnings.append(
-            "Higher timeframe trend conflict."
+# ============================================================
+# SIGNAL ENGINE
+# ============================================================
+
+def generate_signal(
+    df: pd.DataFrame,
+    market_status: str,
+    volume_info: dict,
+    structure: str,
+    candle: str,
+    volatility: dict,
+    bollinger: dict,
+    breakout: dict,
+    timeframe_data: dict
+):
+
+    row = df.iloc[-1]
+
+    close = row["Close"]
+
+    bullish = 0.0
+    bearish = 0.0
+
+    bullish_reasons = []
+    bearish_reasons = []
+
+    # ========================================================
+    # EMA 9 / 20
+    # ========================================================
+
+    if (
+        row["EMA9"] >
+        row["EMA20"]
+    ):
+
+        bullish += 1
+        bullish_reasons.append(
+            "EMA9 above EMA20"
         )
 
-    # --------------------------------------------------------
+    elif (
+        row["EMA9"] <
+        row["EMA20"]
+    ):
+
+        bearish += 1
+        bearish_reasons.append(
+            "EMA9 below EMA20"
+        )
+
+    # ========================================================
+    # EMA 20 / 50
+    # ========================================================
+
+    if (
+        row["EMA20"] >
+        row["EMA50"]
+    ):
+
+        bullish += 1
+        bullish_reasons.append(
+            "EMA20 above EMA50"
+        )
+
+    elif (
+        row["EMA20"] <
+        row["EMA50"]
+    ):
+
+        bearish += 1
+        bearish_reasons.append(
+            "EMA20 below EMA50"
+        )
+
+    # ========================================================
+    # EMA 50 / 100 / 200
+    # ========================================================
+
+    if (
+        row["EMA50"] >
+        row["EMA100"] >
+        row["EMA200"]
+    ):
+
+        bullish += 1.0
+
+        bullish_reasons.append(
+            "Long-term EMA structure bullish"
+        )
+
+    elif (
+        row["EMA50"] <
+        row["EMA100"] <
+        row["EMA200"]
+    ):
+
+        bearish += 1.0
+
+        bearish_reasons.append(
+            "Long-term EMA structure bearish"
+        )
+
+    # ========================================================
+    # PRICE vs EMA20
+    # ========================================================
+
+    if close > row["EMA20"]:
+
+        bullish += 1
+        bullish_reasons.append(
+            "Price above EMA20"
+        )
+
+    elif close < row["EMA20"]:
+
+        bearish += 1
+        bearish_reasons.append(
+            "Price below EMA20"
+        )
+
+    # ========================================================
+    # RSI
+    # ========================================================
+
+    rsi = row["RSI14"]
+
+    if not pd.isna(rsi):
+
+        if 55 <= rsi <= 70:
+
+            bullish += 1
+            bullish_reasons.append(
+                "RSI bullish"
+            )
+
+        elif 30 <= rsi <= 45:
+
+            bearish += 1
+            bearish_reasons.append(
+                "RSI bearish"
+            )
+
+        elif rsi > 70:
+
+            bearish += 0.5
+
+        elif rsi < 30:
+
+            bullish += 0.5
+
+    # ========================================================
+    # MACD
+    # ========================================================
+
+    macd = row["MACD"]
+    macd_signal = row["MACD_SIGNAL"]
+    macd_hist = row["MACD_HIST"]
+
+    if (
+        not pd.isna(macd) and
+        not pd.isna(macd_signal)
+    ):
+
+        if macd > macd_signal:
+
+            bullish += 1
+            bullish_reasons.append(
+                "MACD bullish"
+            )
+
+        elif macd < macd_signal:
+
+            bearish += 1
+            bearish_reasons.append(
+                "MACD bearish"
+            )
+
+    if not pd.isna(macd_hist):
+
+        if macd_hist > 0:
+            bullish += 0.5
+
+        elif macd_hist < 0:
+            bearish += 0.5
+
+    # ========================================================
+    # VWAP
+    # ========================================================
+
+    vwap = row["VWAP"]
+
+    if not pd.isna(vwap):
+
+        if close > vwap:
+
+            bullish += 1
+            bullish_reasons.append(
+                "Price above VWAP"
+            )
+
+        elif close < vwap:
+
+            bearish += 1
+            bearish_reasons.append(
+                "Price below VWAP"
+            )
+
+    # ========================================================
+    # MOMENTUM
+    # ========================================================
+
+    momentum = row["MOMENTUM"]
+
+    if not pd.isna(momentum):
+
+        if momentum > 0:
+
+            bullish += 1
+            bullish_reasons.append(
+                "Positive momentum"
+            )
+
+        elif momentum < 0:
+
+            bearish += 1
+            bearish_reasons.append(
+                "Negative momentum"
+            )
+
+    # ========================================================
+    # ADX + DI
+    # ========================================================
+
+    adx = row["ADX14"]
+    plus_di = row["PLUS_DI"]
+    minus_di = row["MINUS_DI"]
+
+    if not any(
+        pd.isna(x)
+        for x in [
+            adx,
+            plus_di,
+            minus_di
+        ]
+    ):
+
+        if adx >= 20:
+
+            if plus_di > minus_di:
+
+                bullish += 1
+                bullish_reasons.append(
+                    "Directional strength favors buyers"
+                )
+
+            elif minus_di > plus_di:
+
+                bearish += 1
+                bearish_reasons.append(
+                    "Directional strength favors sellers"
+                )
+
+    # ========================================================
+    # MARKET STRUCTURE
+    # ========================================================
+
+    if structure == "HH_HL":
+
+        bullish += 1
+        bullish_reasons.append(
+            "Higher-high / higher-low structure"
+        )
+
+    elif structure == "LH_LL":
+
+        bearish += 1
+        bearish_reasons.append(
+            "Lower-high / lower-low structure"
+        )
+
+    elif structure == "RANGE":
+
+        bullish -= 0.25
+        bearish -= 0.25
+
+    # ========================================================
+    # CANDLE
+    # ========================================================
+
+    if candle in [
+        "BULLISH_ENGULFING",
+        "HAMMER",
+        "STRONG_BULLISH"
+    ]:
+
+        bullish += 1
+        bullish_reasons.append(
+            f"{candle.replace('_', ' ').title()} candle"
+        )
+
+    elif candle in [
+        "BEARISH_ENGULFING",
+        "SHOOTING_STAR",
+        "STRONG_BEARISH"
+    ]:
+
+        bearish += 1
+        bearish_reasons.append(
+            f"{candle.replace('_', ' ').title()} candle"
+        )
+
+    # ========================================================
+    # BREAKOUT
+    # ========================================================
+
+    if breakout["breakout_confirmed"]:
+
+        bullish += 2
+
+        bullish_reasons.append(
+            "Resistance breakout"
+        )
+
+        if breakout["strength"] == "STRONG":
+            bullish += 0.5
+
+    if breakout["breakdown_confirmed"]:
+
+        bearish += 2
+
+        bearish_reasons.append(
+            "Support breakdown"
+        )
+
+        if breakout["strength"] == "STRONG":
+            bearish += 0.5
+
+    # ========================================================
+    # VOLUME
+    # ========================================================
+
+    if volume_info["available"]:
+
+        ratio = volume_info["ratio"]
+
+        if (
+            ratio is not None and
+            ratio >= 1.20
+        ):
+
+            if bullish > bearish:
+
+                bullish += 1
+                bullish_reasons.append(
+                    "Volume confirmation"
+                )
+
+            elif bearish > bullish:
+
+                bearish += 1
+                bearish_reasons.append(
+                    "Volume confirmation"
+                )
+
+    # ========================================================
+    # MTF
+    # ========================================================
+
+    alignment = calculate_mtf_alignment(
+        timeframe_data
+    )
+
+    if alignment == "FULL_BULLISH":
+
+        bullish += 2
+
+        bullish_reasons.append(
+            "Higher timeframes aligned bullish"
+        )
+
+    elif alignment == "BULLISH_BIAS":
+
+        bullish += 1
+
+    elif alignment == "FULL_BEARISH":
+
+        bearish += 2
+
+        bearish_reasons.append(
+            "Higher timeframes aligned bearish"
+        )
+
+    elif alignment == "BEARISH_BIAS":
+
+        bearish += 1
+
+    # ========================================================
     # MARKET REGIME
-    # --------------------------------------------------------
+    # ========================================================
 
     regime = calculate_market_regime(df)
 
-    if regime == "RANGE_CHOP":
+    if regime == "TREND_UP":
 
-        warnings.append(
-            "Market is in range/choppy regime."
+        bullish += 1
+
+        bullish_reasons.append(
+            "Trending market favors buyers"
         )
 
-    # --------------------------------------------------------
+    elif regime == "TREND_DOWN":
+
+        bearish += 1
+
+        bearish_reasons.append(
+            "Trending market favors sellers"
+        )
+
+    elif regime == "RANGE_CHOP":
+
+        bullish -= 0.5
+        bearish -= 0.5
+
+    # ========================================================
     # VOLATILITY FILTER
-    # --------------------------------------------------------
+    # ========================================================
 
-    if volatility.get("status") == "LOW":
+    volatility_status = volatility.get(
+        "status"
+    )
 
-        warnings.append(
-            "Volatility is unusually low."
-        )
+    if volatility_status == "LOW":
 
-    # --------------------------------------------------------
-    # BOLLINGER
-    # --------------------------------------------------------
+        bullish -= 0.5
+        bearish -= 0.5
 
-    if bollinger.get("squeeze"):
-
-        warnings.append(
-            "Bollinger squeeze detected; breakout may be developing."
-        )
+    # ========================================================
+    # BOLLINGER EXPANSION
+    # ========================================================
 
     if bollinger.get("expansion"):
 
-        reasons.append(
-            "Bollinger volatility expansion"
-        )
+        if bullish > bearish:
+            bullish += 0.5
 
-    # --------------------------------------------------------
-    # FINAL SIGNAL
-    # --------------------------------------------------------
+        elif bearish > bullish:
+            bearish += 0.5
+
+    # ========================================================
+    # FINAL SCORE
+    # ========================================================
+
+    bullish = max(
+        0.0,
+        bullish
+    )
+
+    bearish = max(
+        0.0,
+        bearish
+    )
 
     net_score = (
         bullish -
@@ -1683,415 +2228,706 @@ def generate_signal(
         ) * 100
 
     else:
+
         confidence = 0
 
     confidence = min(
-        95,
-        max(
-            0,
-            confidence
-        )
+        confidence,
+        95
     )
 
-    signal = "NEUTRAL"
+    # ========================================================
+    # HTF CONFLICT
+    # ========================================================
 
-    # --------------------------------------------------------
-    # SAFETY GATES
-    # --------------------------------------------------------
+    htf_conflict = detect_htf_conflict(
+        timeframe_data
+    )
 
-    if market_status != "LIVE":
+    # ========================================================
+    # DECISION
+    # ========================================================
 
-        warnings.append(
-            "Market is not LIVE. Trade signal disabled."
+    decision = "WAIT"
+
+    no_trade_reason = ""
+
+    if market_status not in [
+        "LIVE",
+        "DELAYED"
+    ]:
+
+        no_trade_reason = (
+            "Market is not in active trading state."
         )
 
     elif htf_conflict:
 
-        warnings.append(
-            "Trade blocked because higher timeframes conflict."
+        no_trade_reason = (
+            "Higher timeframes are conflicting."
         )
 
     elif regime == "RANGE_CHOP":
 
-        warnings.append(
-            "Trade blocked in range/choppy market."
+        no_trade_reason = (
+            "Market is range-bound/choppy."
         )
 
-    elif volatility.get("status") == "LOW":
+    elif volatility_status == "LOW":
 
-        warnings.append(
-            "Trade blocked because volatility is too low."
+        no_trade_reason = (
+            "Volatility is too low for a strong setup."
         )
 
+    elif (
+        bullish >= 10 and
+        net_score >= 3 and
+        confidence >= 58
+    ):
+
+        decision = "BUY"
+
+    elif (
+        bearish >= 10 and
+        net_score <= -3 and
+        confidence >= 58
+    ):
+
+        decision = "SELL"
+
     else:
 
-        # BUY
-        if (
-            bullish >= 9 and
-            net_score >= 3 and
-            bullish_confirmations >= 6
-        ):
-
-            signal = "BUY"
-
-        # SELL
-        elif (
-            bearish >= 9 and
-            net_score <= -3 and
-            bearish_confirmations >= 6
-        ):
-
-            signal = "SELL"
+        no_trade_reason = (
+            "Signal strength is not strong enough."
+        )
 
     # --------------------------------------------------------
-    # SIGNAL QUALITY
+    # Compatibility field
     # --------------------------------------------------------
 
-    if signal in ["BUY", "SELL"]:
+    if decision == "BUY":
+        signal = "BUY"
 
-        if (
-            breakout_volume_confirmed and
-            not htf_conflict
-        ):
-            signal_quality = "HIGH"
+    elif decision == "SELL":
+        signal = "SELL"
 
-        elif (
-            abs(net_score) >= 5
-        ):
-            signal_quality = "MEDIUM"
+    else:
+        signal = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # Signal quality
+    # --------------------------------------------------------
+
+    if decision in [
+        "BUY",
+        "SELL"
+    ]:
+
+        if confidence >= 75:
+            quality = "HIGH"
+
+        elif confidence >= 62:
+            quality = "MEDIUM"
 
         else:
-            signal_quality = "LOW"
+            quality = "LOW"
 
     else:
 
-        signal_quality = "LOW"
+        quality = "LOW"
 
     # --------------------------------------------------------
-    # NO TRADE REASON
+    # Strength
     # --------------------------------------------------------
 
-    if signal == "NEUTRAL":
-
-        if market_status != "LIVE":
-            no_trade_reason = "Market not LIVE"
-
-        elif htf_conflict:
-            no_trade_reason = "Higher timeframe conflict"
-
-        elif regime == "RANGE_CHOP":
-            no_trade_reason = "Range / choppy market"
-
-        elif volatility.get("status") == "LOW":
-            no_trade_reason = "Low volatility"
-
-        elif abs(net_score) < 3:
-            no_trade_reason = "Insufficient directional confirmation"
-
-        else:
-            no_trade_reason = "Signal confirmation incomplete"
-
-    else:
-
-        no_trade_reason = None
+    strength = int(
+        round(confidence)
+    )
 
     return {
         "signal": signal,
-        "signal_strength": (
-            "HIGH"
-            if signal_quality == "HIGH"
-            else (
-                "MEDIUM"
-                if signal_quality == "MEDIUM"
-                else "LOW"
-            )
-        ),
-        "confidence": round(
+        "decision": decision,
+        "confidence": safe_float(
             confidence,
             1
         ),
-        "bullish_score": bullish,
-        "bearish_score": bearish,
-        "reasons": reasons[-12:],
-        "warnings": warnings[-12:],
-        "signal_quality": signal_quality,
+        "strength": strength,
+        "bullish_score": safe_float(
+            bullish,
+            1
+        ),
+        "bearish_score": safe_float(
+            bearish,
+            1
+        ),
+        "net_score": safe_float(
+            net_score,
+            1
+        ),
+        "quality": quality,
+        "bullish_reasons": bullish_reasons[
+            :8
+        ],
+        "bearish_reasons": bearish_reasons[
+            :8
+        ],
         "no_trade_reason": no_trade_reason,
-        "breakout_volume_confirmed":
-            breakout_volume_confirmed,
         "market_regime": regime,
         "htf_conflict": htf_conflict,
-        "current_trend": current_trend
+        "mtf_alignment": alignment
     }
 
 
 # ============================================================
 # TRADE PLAN
-# EXISTING STYLE PRESERVED
 # ============================================================
 
 def calculate_trade_plan(
-    df,
-    signal
+    df: pd.DataFrame,
+    signal_info: dict,
+    sr: dict
 ):
 
-    if df.empty:
-        return {
-            "trade_status": "NO TRADE",
-            "entry": None,
-            "stop_loss": None,
-            "target_1": None,
-            "target_2": None,
-            "trailing_stop": None
-        }
+    decision = signal_info.get(
+        "decision"
+    )
 
-    if signal not in [
+    if decision not in [
         "BUY",
         "SELL"
     ]:
+
         return {
-            "trade_status": "NO TRADE",
+            "status": "NO TRADE",
             "entry": None,
+            "entry_low": None,
+            "entry_high": None,
             "stop_loss": None,
             "target_1": None,
             "target_2": None,
-            "trailing_stop": None
+            "trailing_stop": None,
+            "risk_points": None,
+            "reward_1_points": None,
+            "reward_2_points": None,
+            "risk_reward_1": None,
+            "risk_reward_2": None
         }
 
-    latest = df.iloc[-1]
+    row = df.iloc[-1]
 
-    entry = safe_float(
-        latest["Close"]
-    )
+    entry = float(row["Close"])
+    atr = row["ATR14"]
 
-    atr = safe_float(
-        latest["ATR14"]
-    )
+    if (
+        atr is None or
+        pd.isna(atr) or
+        atr <= 0
+    ):
 
-    if entry is None or atr is None:
         return {
-            "trade_status": "NO TRADE",
+            "status": "NO TRADE",
             "entry": None,
+            "entry_low": None,
+            "entry_high": None,
             "stop_loss": None,
             "target_1": None,
             "target_2": None,
-            "trailing_stop": None
+            "trailing_stop": None,
+            "risk_points": None,
+            "reward_1_points": None,
+            "reward_2_points": None,
+            "risk_reward_1": None,
+            "risk_reward_2": None
         }
 
-    if signal == "BUY":
+    atr = float(atr)
 
-        stop_loss = (
+    # ========================================================
+    # BUY
+    # ========================================================
+
+    if decision == "BUY":
+
+        base_sl = (
             entry -
-            1.2 * atr
+            atr * 1.2
+        )
+
+        support = sr.get("support")
+
+        if support is not None:
+
+            support_sl = (
+                support -
+                atr * 0.20
+            )
+
+            stop_loss = min(
+                base_sl,
+                support_sl
+            )
+
+        else:
+
+            stop_loss = base_sl
+
+        risk = (
+            entry -
+            stop_loss
         )
 
         target_1 = (
             entry +
-            1.8 * atr
+            max(
+                atr * 1.8,
+                risk * 1.5
+            )
         )
 
         target_2 = (
             entry +
-            2.8 * atr
+            max(
+                atr * 2.8,
+                risk * 2.3
+            )
         )
 
         trailing_stop = (
             entry -
-            1.0 * atr
+            atr
         )
+
+    # ========================================================
+    # SELL
+    # ========================================================
 
     else:
 
-        stop_loss = (
+        base_sl = (
             entry +
-            1.2 * atr
+            atr * 1.2
+        )
+
+        resistance = sr.get(
+            "resistance"
+        )
+
+        if resistance is not None:
+
+            resistance_sl = (
+                resistance +
+                atr * 0.20
+            )
+
+            stop_loss = max(
+                base_sl,
+                resistance_sl
+            )
+
+        else:
+
+            stop_loss = base_sl
+
+        risk = (
+            stop_loss -
+            entry
         )
 
         target_1 = (
             entry -
-            1.8 * atr
+            max(
+                atr * 1.8,
+                risk * 1.5
+            )
         )
 
         target_2 = (
             entry -
-            2.8 * atr
+            max(
+                atr * 2.8,
+                risk * 2.3
+            )
         )
 
         trailing_stop = (
             entry +
-            1.0 * atr
+            atr
         )
 
-    return {
-        "trade_status": "TRADE",
-        "entry": round_value(entry),
-        "stop_loss": round_value(stop_loss),
-        "target_1": round_value(target_1),
-        "target_2": round_value(target_2),
-        "trailing_stop": round_value(
-            trailing_stop
-        )
-    }
+    if risk <= 0:
 
-
-# ============================================================
-# HIGHER TIMEFRAME TRENDS
-# ============================================================
-
-def get_higher_timeframe_trends():
-
-    result = {
-        "15m": "SIDEWAYS",
-        "30m": "SIDEWAYS",
-        "1h": "SIDEWAYS"
-    }
-
-    for interval in [
-        "15m",
-        "30m",
-        "1h"
-    ]:
-
-        try:
-
-            df = fetch_history(
-                interval
-            )
-
-            if not df.empty:
-
-                df = calculate_indicators(
-                    df
-                )
-
-                result[interval] = calculate_trend(
-                    df
-                )
-
-        except Exception:
-            result[interval] = "SIDEWAYS"
-
-    return result
-
-
-# ============================================================
-# FALSE BREAKOUT DETECTION
-# ============================================================
-
-def detect_false_breakout(
-    df,
-    sr
-):
-
-    if len(df) < 3:
         return {
-            "false_breakout": False,
-            "false_breakdown": False
+            "status": "NO TRADE",
+            "entry": None,
+            "entry_low": None,
+            "entry_high": None,
+            "stop_loss": None,
+            "target_1": None,
+            "target_2": None,
+            "trailing_stop": None,
+            "risk_points": None,
+            "reward_1_points": None,
+            "reward_2_points": None,
+            "risk_reward_1": None,
+            "risk_reward_2": None
         }
 
-    previous = df.iloc[-2]
-    current = df.iloc[-1]
-
-    previous_close = safe_float(
-        previous["Close"]
+    reward1 = abs(
+        target_1 -
+        entry
     )
 
-    current_close = safe_float(
-        current["Close"]
+    reward2 = abs(
+        target_2 -
+        entry
     )
 
-    resistance = sr.get(
-        "resistance"
+    rr1 = reward1 / risk
+    rr2 = reward2 / risk
+
+    entry_buffer = atr * 0.25
+
+    entry_low = (
+        entry -
+        entry_buffer
     )
 
-    support = sr.get(
-        "support"
+    entry_high = (
+        entry +
+        entry_buffer
     )
-
-    false_breakout = False
-    false_breakdown = False
-
-    if (
-        resistance is not None and
-        previous_close is not None and
-        current_close is not None
-    ):
-
-        current_high = safe_float(
-            current["High"]
-        )
-
-        if (
-            current_high is not None and
-            current_high > resistance and
-            current_close < resistance
-        ):
-            false_breakout = True
-
-    if (
-        support is not None and
-        previous_close is not None and
-        current_close is not None
-    ):
-
-        current_low = safe_float(
-            current["Low"]
-        )
-
-        if (
-            current_low is not None and
-            current_low < support and
-            current_close > support
-        ):
-            false_breakdown = True
 
     return {
-        "false_breakout": false_breakout,
-        "false_breakdown": false_breakdown
+        "status": "TRADE",
+        "entry": safe_float(entry),
+        "entry_low": safe_float(
+            entry_low
+        ),
+        "entry_high": safe_float(
+            entry_high
+        ),
+        "stop_loss": safe_float(
+            stop_loss
+        ),
+        "target_1": safe_float(
+            target_1
+        ),
+        "target_2": safe_float(
+            target_2
+        ),
+        "trailing_stop": safe_float(
+            trailing_stop
+        ),
+        "risk_points": safe_float(
+            risk
+        ),
+        "reward_1_points": safe_float(
+            reward1
+        ),
+        "reward_2_points": safe_float(
+            reward2
+        ),
+        "risk_reward_1": safe_float(
+            rr1,
+            2
+        ),
+        "risk_reward_2": safe_float(
+            rr2,
+            2
+        )
     }
 
 
 # ============================================================
-# BUILD COMPLETE ANALYSIS
+# ENTRY / AVOID ZONES
+# ============================================================
+
+def calculate_zones(
+    df: pd.DataFrame,
+    trade_plan: dict,
+    signal_info: dict,
+    sr: dict
+):
+
+    if trade_plan["status"] != "TRADE":
+
+        return {
+            "entry_zone": None,
+            "avoid_zone": (
+                signal_info.get(
+                    "no_trade_reason"
+                ) or
+                "No high-quality setup."
+            )
+        }
+
+    entry_low = trade_plan.get(
+        "entry_low"
+    )
+
+    entry_high = trade_plan.get(
+        "entry_high"
+    )
+
+    decision = signal_info.get(
+        "decision"
+    )
+
+    if (
+        entry_low is None or
+        entry_high is None
+    ):
+
+        entry_zone = None
+
+    else:
+
+        entry_zone = (
+            f"{entry_low:.2f} - "
+            f"{entry_high:.2f}"
+        )
+
+    if decision == "BUY":
+
+        resistance = sr.get(
+            "resistance"
+        )
+
+        if resistance is not None:
+
+            avoid_zone = (
+                f"Avoid fresh BUY near "
+                f"{resistance:.2f} resistance "
+                f"unless breakout holds."
+            )
+
+        else:
+
+            avoid_zone = (
+                "Avoid chasing extended candles."
+            )
+
+    else:
+
+        support = sr.get(
+            "support"
+        )
+
+        if support is not None:
+
+            avoid_zone = (
+                f"Avoid fresh SELL near "
+                f"{support:.2f} support "
+                f"unless breakdown holds."
+            )
+
+        else:
+
+            avoid_zone = (
+                "Avoid chasing extended candles."
+            )
+
+    return {
+        "entry_zone": entry_zone,
+        "avoid_zone": avoid_zone
+    }
+
+
+# ============================================================
+# HUMAN-READABLE AI ANALYSIS
+# ============================================================
+
+def build_analysis_text(
+    signal_info: dict,
+    trade_plan: dict,
+    trend: str,
+    regime: str,
+    structure: str,
+    mtf_alignment: str,
+    breakout: dict,
+    volatility: dict
+):
+
+    decision = signal_info.get(
+        "decision"
+    )
+
+    confidence = signal_info.get(
+        "confidence"
+    )
+
+    if decision == "BUY":
+
+        text = (
+            f"BUY bias detected with "
+            f"{confidence}% confidence. "
+        )
+
+        if trend == "BULLISH":
+            text += "Short-term trend is bullish. "
+
+        if structure == "HH_HL":
+            text += "Market structure is making higher highs and higher lows. "
+
+        if mtf_alignment in [
+            "FULL_BULLISH",
+            "BULLISH_BIAS"
+        ]:
+            text += "Higher timeframes support the bullish bias. "
+
+        if breakout.get(
+            "breakout_confirmed"
+        ):
+            text += "Resistance breakout is detected. "
+
+        if volatility.get(
+            "status"
+        ) == "HIGH":
+            text += "Volatility is elevated, so risk management is important. "
+
+        if trade_plan.get(
+            "status"
+        ) == "TRADE":
+
+            text += (
+                f"Entry around "
+                f"{trade_plan['entry']:.2f}, "
+                f"SL {trade_plan['stop_loss']:.2f}, "
+                f"T1 {trade_plan['target_1']:.2f}, "
+                f"T2 {trade_plan['target_2']:.2f}."
+            )
+
+        return text
+
+    if decision == "SELL":
+
+        text = (
+            f"SELL bias detected with "
+            f"{confidence}% confidence. "
+        )
+
+        if trend == "BEARISH":
+            text += "Short-term trend is bearish. "
+
+        if structure == "LH_LL":
+            text += "Market structure is making lower highs and lower lows. "
+
+        if mtf_alignment in [
+            "FULL_BEARISH",
+            "BEARISH_BIAS"
+        ]:
+            text += "Higher timeframes support the bearish bias. "
+
+        if breakout.get(
+            "breakdown_confirmed"
+        ):
+            text += "Support breakdown is detected. "
+
+        if volatility.get(
+            "status"
+        ) == "HIGH":
+            text += "Volatility is elevated, so risk management is important. "
+
+        if trade_plan.get(
+            "status"
+        ) == "TRADE":
+
+            text += (
+                f"Entry around "
+                f"{trade_plan['entry']:.2f}, "
+                f"SL {trade_plan['stop_loss']:.2f}, "
+                f"T1 {trade_plan['target_1']:.2f}, "
+                f"T2 {trade_plan['target_2']:.2f}."
+            )
+
+        return text
+
+    reason = signal_info.get(
+        "no_trade_reason"
+    )
+
+    if not reason:
+        reason = (
+            "No strong directional edge."
+        )
+
+    return (
+        f"WAIT — {reason} "
+        f"Current market regime: {regime}. "
+        f"MTF alignment: {mtf_alignment}. "
+        f"Best approach is to wait for stronger confirmation."
+    )
+
+
+# ============================================================
+# MAIN ANALYSIS
 # ============================================================
 
 def build_analysis(
     interval: str = "5m"
 ):
 
-    df = fetch_history(
-        interval
-    )
+    # ========================================================
+    # MAIN DATA
+    # ========================================================
+
+    df = fetch_history(interval)
 
     if df.empty:
 
         raise HTTPException(
             status_code=503,
-            detail="Unable to fetch NIFTY data."
+            detail="Market data unavailable."
         )
 
     df = calculate_indicators(
         df
     )
 
-    latest = df.iloc[-1]
+    current = df.iloc[-1]
+
+    price = safe_float(
+        current["Close"]
+    )
+
+    # ========================================================
+    # TIMESTAMP
+    # ========================================================
 
     latest_timestamp = df.index[-1]
 
-    market_status = get_market_status(
+    market_info = get_market_status(
         latest_timestamp
     )
 
-    price = safe_float(
-        latest["Close"]
-    )
+    market_status = market_info[
+        "status"
+    ]
 
-    previous_close = None
+    try:
+
+        data_age = (
+            now_ist() -
+            latest_timestamp
+        ).total_seconds()
+
+    except Exception:
+
+        data_age = None
+
+    # ========================================================
+    # PREVIOUS CLOSE
+    # ========================================================
 
     if len(df) >= 2:
 
         previous_close = safe_float(
             df["Close"].iloc[-2]
         )
+
+    else:
+
+        previous_close = None
 
     if (
         price is not None and
@@ -2113,669 +2949,948 @@ def build_analysis(
         change = None
         change_percent = None
 
-    # --------------------------------------------------------
-    # Existing indicators
-    # --------------------------------------------------------
+    # ========================================================
+    # DAY STATS
+    # ========================================================
 
-    ma5 = safe_float(
-        latest["MA5"]
+    day_stats = get_day_statistics(
+        df
     )
 
-    ma10 = safe_float(
-        latest["MA10"]
-    )
+    # ========================================================
+    # INDICATORS
+    # ========================================================
 
-    ma20 = safe_float(
-        latest["MA20"]
-    )
+    indicators = {
+        "ma5": safe_float(
+            current["MA5"]
+        ),
+        "ma10": safe_float(
+            current["MA10"]
+        ),
+        "ma20": safe_float(
+            current["MA20"]
+        ),
+        "ema9": safe_float(
+            current["EMA9"]
+        ),
+        "ema20": safe_float(
+            current["EMA20"]
+        ),
+        "ema50": safe_float(
+            current["EMA50"]
+        ),
+        "ema100": safe_float(
+            current["EMA100"]
+        ),
+        "ema200": safe_float(
+            current["EMA200"]
+        ),
+        "rsi": safe_float(
+            current["RSI14"]
+        ),
+        "macd": safe_float(
+            current["MACD"],
+            4
+        ),
+        "macd_signal": safe_float(
+            current["MACD_SIGNAL"],
+            4
+        ),
+        "macd_histogram": safe_float(
+            current["MACD_HIST"],
+            4
+        ),
+        "momentum": safe_float(
+            current["MOMENTUM"]
+        ),
+        "atr": safe_float(
+            current["ATR14"]
+        ),
+        "adx": safe_float(
+            current["ADX14"]
+        ),
+        "plus_di": safe_float(
+            current["PLUS_DI"]
+        ),
+        "minus_di": safe_float(
+            current["MINUS_DI"]
+        ),
+        "vwap": safe_float(
+            current["VWAP"]
+        ),
+        "bollinger_middle": safe_float(
+            current["BB_MIDDLE"]
+        ),
+        "bollinger_upper": safe_float(
+            current["BB_UPPER"]
+        ),
+        "bollinger_lower": safe_float(
+            current["BB_LOWER"]
+        ),
+        "bollinger_width": safe_float(
+            current["BB_WIDTH"],
+            4
+        )
+    }
 
-    ema9 = safe_float(
-        latest["EMA9"]
-    )
-
-    ema20 = safe_float(
-        latest["EMA20"]
-    )
-
-    ema50 = safe_float(
-        latest["EMA50"]
-    )
-
-    ema100 = safe_float(
-        latest["EMA100"]
-    )
-
-    ema200 = safe_float(
-        latest["EMA200"]
-    )
-
-    rsi = safe_float(
-        latest["RSI14"]
-    )
-
-    macd = safe_float(
-        latest["MACD"]
-    )
-
-    macd_signal = safe_float(
-        latest["MACD_SIGNAL"]
-    )
-
-    macd_hist = safe_float(
-        latest["MACD_HIST"]
-    )
-
-    momentum = safe_float(
-        latest["MOMENTUM"]
-    )
-
-    atr = safe_float(
-        latest["ATR14"]
-    )
-
-    adx = safe_float(
-        latest["ADX14"]
-    )
-
-    plus_di = safe_float(
-        latest["PLUS_DI14"]
-    )
-
-    minus_di = safe_float(
-        latest["MINUS_DI14"]
-    )
-
-    vwap = safe_float(
-        latest["VWAP"]
-    )
-
-    bb_middle = safe_float(
-        latest["BB_MIDDLE"]
-    )
-
-    bb_upper = safe_float(
-        latest["BB_UPPER"]
-    )
-
-    bb_lower = safe_float(
-        latest["BB_LOWER"]
-    )
-
-    # --------------------------------------------------------
-    # Support resistance
-    # --------------------------------------------------------
+    # ========================================================
+    # SUPPORT / RESISTANCE
+    # ========================================================
 
     sr = calculate_support_resistance(
         df
     )
 
-    # --------------------------------------------------------
-    # Volume
-    # --------------------------------------------------------
+    # ========================================================
+    # VOLUME
+    # ========================================================
 
     volume_info = calculate_volume_status(
         df
     )
 
-    # --------------------------------------------------------
-    # New analysis
-    # --------------------------------------------------------
+    # ========================================================
+    # STRUCTURE
+    # ========================================================
 
-    market_structure = (
-        calculate_market_structure(df)
-    )
-
-    candle_pattern = (
-        detect_candle_pattern(df)
-    )
-
-    volatility = (
-        calculate_volatility(df)
-    )
-
-    bollinger = (
-        calculate_bollinger_state(df)
-    )
-
-    previous_day = (
-        get_previous_day_levels()
-    )
-
-    day_open = get_day_open(
+    structure = calculate_market_structure(
         df
     )
 
-    if day_open is None:
-        day_open = previous_day.get(
-            "day_open"
-        )
+    # ========================================================
+    # CANDLE
+    # ========================================================
 
-    previous_day_high = (
-        previous_day.get(
-            "previous_day_high"
-        )
+    candle = detect_candle_pattern(
+        df
     )
 
-    previous_day_low = (
-        previous_day.get(
-            "previous_day_low"
-        )
+    # ========================================================
+    # VOLATILITY
+    # ========================================================
+
+    volatility = calculate_volatility(
+        df
     )
 
-    previous_day_close = (
-        previous_day.get(
-            "previous_day_close"
-        )
+    # ========================================================
+    # BOLLINGER
+    # ========================================================
+
+    bollinger = calculate_bollinger_state(
+        df
     )
 
-    pivots = calculate_pivots(
-        previous_day_high,
-        previous_day_low,
-        previous_day_close
-    )
-
-    # --------------------------------------------------------
-    # Higher timeframe
-    # --------------------------------------------------------
-
-    htf_trends = (
-        get_higher_timeframe_trends()
-    )
-
-    # --------------------------------------------------------
-    # Signal
-    # --------------------------------------------------------
-
-    signal_data = generate_signal(
-        df=df,
-        market_status=market_status,
-        htf_trends=htf_trends,
-        sr=sr,
-        volume_info=volume_info,
-        market_structure=market_structure,
-        candle_pattern=candle_pattern,
-        volatility=volatility,
-        bollinger=bollinger
-    )
-
-    signal = signal_data["signal"]
-
-    # --------------------------------------------------------
-    # False breakout
-    # --------------------------------------------------------
-
-    false_breakout_data = (
-        detect_false_breakout(
-            df,
-            sr
-        )
-    )
-
-    if false_breakout_data[
-        "false_breakout"
-    ]:
-
-        signal_data["warnings"].append(
-            "Possible false breakout detected."
-        )
-
-    if false_breakout_data[
-        "false_breakdown"
-    ]:
-
-        signal_data["warnings"].append(
-            "Possible false breakdown detected."
-        )
-
-    # --------------------------------------------------------
-    # Trade plan
-    # --------------------------------------------------------
-
-    trade_plan = calculate_trade_plan(
-        df,
-        signal
-        if market_status == "LIVE"
-        else "NEUTRAL"
-    )
-
-    # --------------------------------------------------------
-    # Data age
-    # --------------------------------------------------------
-
-    try:
-
-        latest_aware = latest_timestamp
-
-        if latest_aware.tzinfo is None:
-            latest_aware = latest_aware.replace(
-                tzinfo=IST
-            )
-
-        age = (
-            now_ist() -
-            latest_aware.astimezone(IST)
-        ).total_seconds()
-
-    except Exception:
-        age = None
-
-    # --------------------------------------------------------
-    # Trend
-    # --------------------------------------------------------
+    # ========================================================
+    # TREND
+    # ========================================================
 
     trend = calculate_trend(
         df
     )
 
-    # Preserve old higher timeframe field
-    higher_timeframe_trend = (
-        htf_trends.get(
-            "15m",
-            "SIDEWAYS"
-        )
+    long_trend = calculate_long_trend(
+        df
     )
 
-    higher_tf_conflict = (
-        signal_data.get(
-            "htf_conflict",
-            False
-        )
+    regime = calculate_market_regime(
+        df
     )
 
-    # --------------------------------------------------------
-    # Volume status
-    # --------------------------------------------------------
+    # ========================================================
+    # PREVIOUS DAY
+    # ========================================================
 
-    volume_status = volume_info.get(
-        "status",
-        "UNAVAILABLE"
+    previous_day = get_previous_day_levels()
+
+    # ========================================================
+    # PIVOTS
+    # ========================================================
+
+    pivots = calculate_pivots(
+        previous_day["high"],
+        previous_day["low"],
+        previous_day["close"]
     )
 
-    # --------------------------------------------------------
-    # Signal strength
-    # --------------------------------------------------------
+    # ========================================================
+    # HIGHER TIMEFRAMES
+    # ========================================================
 
-    signal_strength = signal_data.get(
-        "signal_strength",
-        "LOW"
+    timeframe_data = (
+        get_higher_timeframe_analysis()
     )
 
-    # --------------------------------------------------------
-    # Main response
-    # --------------------------------------------------------
+    mtf_alignment = calculate_mtf_alignment(
+        timeframe_data
+    )
+
+    htf_conflict = detect_htf_conflict(
+        timeframe_data
+    )
+
+    # ========================================================
+    # BREAKOUT
+    # ========================================================
+
+    breakout = detect_breakout(
+        df,
+        sr,
+        volume_info
+    )
+
+    # ========================================================
+    # FALSE BREAKOUT
+    # ========================================================
+
+    false_breakout = detect_false_breakout(
+        df,
+        sr
+    )
+
+    # ========================================================
+    # SIGNAL
+    # ========================================================
+
+    signal_info = generate_signal(
+        df=df,
+        market_status=market_status,
+        volume_info=volume_info,
+        structure=structure,
+        candle=candle,
+        volatility=volatility,
+        bollinger=bollinger,
+        breakout=breakout,
+        timeframe_data=timeframe_data
+    )
+
+    # ========================================================
+    # TRADE PLAN
+    # ========================================================
+
+    trade_plan = calculate_trade_plan(
+        df,
+        signal_info,
+        sr
+    )
+
+    # ========================================================
+    # ZONES
+    # ========================================================
+
+    zones = calculate_zones(
+        df,
+        trade_plan,
+        signal_info,
+        sr
+    )
+
+    # ========================================================
+    # ANALYSIS TEXT
+    # ========================================================
+
+    analysis_text = build_analysis_text(
+        signal_info=signal_info,
+        trade_plan=trade_plan,
+        trend=trend,
+        regime=regime,
+        structure=structure,
+        mtf_alignment=mtf_alignment,
+        breakout=breakout,
+        volatility=volatility
+    )
+
+    # ========================================================
+    # FLAT COMPATIBILITY FIELDS
+    # ========================================================
+
+    decision = signal_info[
+        "decision"
+    ]
+
+    signal = signal_info[
+        "signal"
+    ]
+
+    confidence = signal_info[
+        "confidence"
+    ]
+
+    # ========================================================
+    # DISTANCES
+    # ========================================================
+
+    support_distance_percent = None
+    resistance_distance_percent = None
+
+    if (
+        price is not None and
+        sr["support"] is not None and
+        price != 0
+    ):
+
+        support_distance_percent = (
+            (
+                price -
+                sr["support"]
+            ) /
+            price
+        ) * 100
+
+    if (
+        price is not None and
+        sr["resistance"] is not None and
+        price != 0
+    ):
+
+        resistance_distance_percent = (
+            (
+                sr["resistance"] -
+                price
+            ) /
+            price
+        ) * 100
+
+    # ========================================================
+    # FINAL RESPONSE
+    # ========================================================
 
     response = {
 
-        # ====================================================
-        # EXISTING FIELDS
-        # ====================================================
+        # ----------------------------------------------------
+        # SYSTEM
+        # ----------------------------------------------------
+
+        "app": "NIFTY AI TRADER",
+
+        "analysis_version": "FINAL-1.0",
+
+        "version": "FINAL-1.0",
+
+        "data_source": (
+            "Yahoo Finance (^NSEI)"
+        ),
 
         "symbol": "NIFTY 50",
 
-        "price": round_value(
-            price
-        ),
+        "symbol_code": SYMBOL,
 
-        "previous_close": round_value(
-            previous_close
-        ),
+        "status": "ok",
 
-        "change": round_value(
+        # ----------------------------------------------------
+        # PRICE
+        # ----------------------------------------------------
+
+        "price": price,
+
+        "previous_close": previous_close,
+
+        "change": safe_float(
             change
         ),
 
-        "change_percent": round_value(
-            change_percent
+        "change_percent": safe_float(
+            change_percent,
+            3
         ),
+
+        "day_open": day_stats["open"],
+
+        "day_high": day_stats["high"],
+
+        "day_low": day_stats["low"],
+
+        # ----------------------------------------------------
+        # MARKET STATUS
+        # ----------------------------------------------------
 
         "market_status": market_status,
 
-        "data_age_seconds": round_value(
-            age,
+        "market_message": market_info[
+            "message"
+        ],
+
+        "data_age_seconds": safe_float(
+            data_age,
             1
         ),
 
         "latest_data_time": (
             latest_timestamp.isoformat()
-            if latest_timestamp is not None
-            else None
         ),
 
-        "trend": trend,
-
-        "higher_timeframe_trend":
-            higher_timeframe_trend,
-
-        "higher_tf_conflict":
-            higher_tf_conflict,
+        # ----------------------------------------------------
+        # MAIN DECISION
+        # ----------------------------------------------------
 
         "signal": signal,
 
-        "signal_strength":
-            signal_strength,
+        "decision": decision,
 
-        "confidence":
-            signal_data.get(
-                "confidence",
-                0
-            ),
-
-        "bullish_score":
-            signal_data.get(
-                "bullish_score",
-                0
-            ),
-
-        "bearish_score":
-            signal_data.get(
-                "bearish_score",
-                0
-            ),
-
-        "volume_status":
-            volume_status,
-
-        "trade_status":
-            trade_plan.get(
-                "trade_status",
-                "NO TRADE"
-            ),
-
-        "analysis_version":
-            "V5.1",
-
-        # ====================================================
-        # OLD INDICATORS
-        # ====================================================
-
-        "ma5": round_value(ma5),
-        "ma10": round_value(ma10),
-        "ma20": round_value(ma20),
-
-        "ema9": round_value(ema9),
-        "ema20": round_value(ema20),
-        "ema50": round_value(ema50),
-        "ema100": round_value(ema100),
-        "ema200": round_value(ema200),
-
-        "rsi14": round_value(rsi),
-        "macd": round_value(macd),
-        "macd_signal": round_value(macd_signal),
-        "macd_histogram": round_value(macd_hist),
-
-        "momentum": round_value(momentum),
-        "atr14": round_value(atr),
-        "adx14": round_value(adx),
-
-        "vwap": round_value(vwap),
-
-        "bollinger_middle":
-            round_value(bb_middle),
-
-        "bollinger_upper":
-            round_value(bb_upper),
-
-        "bollinger_lower":
-            round_value(bb_lower),
-
-        # ====================================================
-        # SUPPORT / RESISTANCE
-        # ====================================================
-
-        "support":
-            round_value(
-                sr.get("support")
-            ),
-
-        "resistance":
-            round_value(
-                sr.get("resistance")
-            ),
-
-        "support2":
-            round_value(
-                sr.get("support2")
-            ),
-
-        "resistance2":
-            round_value(
-                sr.get("resistance2")
-            ),
-
-        # ====================================================
-        # TRADE PLAN
-        # ====================================================
-
-        "entry":
-            trade_plan.get("entry"),
-
-        "stop_loss":
-            trade_plan.get("stop_loss"),
-
-        "target_1":
-            trade_plan.get("target_1"),
-
-        "target_2":
-            trade_plan.get("target_2"),
-
-        "trailing_stop":
-            trade_plan.get("trailing_stop"),
-
-        # ====================================================
-        # REASONS / WARNINGS
-        # ====================================================
-
-        "reasons":
-            signal_data.get(
-                "reasons",
-                []
-            ),
-
-        "warnings":
-            signal_data.get(
-                "warnings",
-                []
-            ),
-
-        # ====================================================
-        # NEW V5.1 ACCURACY DATA
-        # ====================================================
-
-        "plus_di_14":
-            round_value(plus_di),
-
-        "minus_di_14":
-            round_value(minus_di),
-
-        "market_regime":
-            signal_data.get(
-                "market_regime",
-                "UNKNOWN"
-            ),
-
-        "market_structure":
-            market_structure,
-
-        "candle_pattern":
-            candle_pattern,
-
-        "breakout_volume_confirmed":
-            signal_data.get(
-                "breakout_volume_confirmed",
-                False
-            ),
-
-        "bollinger_squeeze":
-            bollinger.get(
-                "squeeze",
-                False
-            ),
-
-        "bollinger_expansion":
-            bollinger.get(
-                "expansion",
-                False
-            ),
-
-        "volatility_status":
-            volatility.get(
-                "status",
-                "UNKNOWN"
-            ),
-
-        "atr_percent":
-            round_value(
-                volatility.get(
-                    "atr_percent"
-                ),
-                3
-            ),
-
-        "atr_ratio":
-            round_value(
-                volatility.get(
-                    "atr_ratio"
-                ),
-                2
-            ),
-
-        # ====================================================
-        # MULTI TIMEFRAME
-        # ====================================================
-
-        "trend_15m":
-            htf_trends.get(
-                "15m",
-                "SIDEWAYS"
-            ),
-
-        "trend_30m":
-            htf_trends.get(
-                "30m",
-                "SIDEWAYS"
-            ),
-
-        "trend_1h":
-            htf_trends.get(
-                "1h",
-                "SIDEWAYS"
-            ),
-
-        "multi_timeframe_alignment": (
-            "BULLISH"
-            if (
-                sum(
-                    1
-                    for x in htf_trends.values()
-                    if x == "BULLISH"
-                ) >= 2
-            )
-            else (
-                "BEARISH"
-                if (
-                    sum(
-                        1
-                        for x in htf_trends.values()
-                        if x == "BEARISH"
-                    ) >= 2
-                )
-                else "MIXED"
-            )
+        "decision_label": (
+            "BUY" if decision == "BUY"
+            else
+            "SELL" if decision == "SELL"
+            else
+            "WAIT"
         ),
 
-        # ====================================================
-        # PREVIOUS DAY LEVELS
-        # ====================================================
+        "signal_strength": signal_info[
+            "strength"
+        ],
 
-        "previous_day_high":
-            round_value(
-                previous_day_high
-            ),
+        "confidence": confidence,
 
-        "previous_day_low":
-            round_value(
-                previous_day_low
-            ),
+        "signal_quality": signal_info[
+            "quality"
+        ],
 
-        "previous_day_close":
-            round_value(
-                previous_day_close
-            ),
+        # ----------------------------------------------------
+        # SCORES
+        # ----------------------------------------------------
 
-        "day_open":
-            round_value(
-                day_open
-            ),
+        "bullish_score": signal_info[
+            "bullish_score"
+        ],
 
-        # ====================================================
+        "bearish_score": signal_info[
+            "bearish_score"
+        ],
+
+        "net_score": signal_info[
+            "net_score"
+        ],
+
+        # ----------------------------------------------------
+        # TREND
+        # ----------------------------------------------------
+
+        "trend": trend,
+
+        "long_term_trend": long_trend,
+
+        "market_regime": regime,
+
+        "market_structure": structure,
+
+        "candle_pattern": candle,
+
+        # ----------------------------------------------------
+        # INDICATORS — FLAT
+        # ----------------------------------------------------
+
+        "ma5": indicators["ma5"],
+
+        "ma10": indicators["ma10"],
+
+        "ma20": indicators["ma20"],
+
+        "ema9": indicators["ema9"],
+
+        "ema20": indicators["ema20"],
+
+        "ema50": indicators["ema50"],
+
+        "ema100": indicators["ema100"],
+
+        "ema200": indicators["ema200"],
+
+        "rsi": indicators["rsi"],
+
+        "macd": indicators["macd"],
+
+        "macd_signal": indicators[
+            "macd_signal"
+        ],
+
+        "macd_histogram": indicators[
+            "macd_histogram"
+        ],
+
+        "momentum": indicators[
+            "momentum"
+        ],
+
+        "atr": indicators["atr"],
+
+        "adx": indicators["adx"],
+
+        "plus_di": indicators[
+            "plus_di"
+        ],
+
+        "minus_di": indicators[
+            "minus_di"
+        ],
+
+        "vwap": indicators["vwap"],
+
+        # ----------------------------------------------------
+        # BOLLINGER
+        # ----------------------------------------------------
+
+        "bollinger_middle": indicators[
+            "bollinger_middle"
+        ],
+
+        "bollinger_upper": indicators[
+            "bollinger_upper"
+        ],
+
+        "bollinger_lower": indicators[
+            "bollinger_lower"
+        ],
+
+        "bollinger_width": indicators[
+            "bollinger_width"
+        ],
+
+        "bollinger_state": bollinger[
+            "state"
+        ],
+
+        "bollinger_squeeze": bollinger[
+            "squeeze"
+        ],
+
+        "bollinger_expansion": bollinger[
+            "expansion"
+        ],
+
+        # ----------------------------------------------------
+        # VOLATILITY
+        # ----------------------------------------------------
+
+        "volatility_status": volatility[
+            "status"
+        ],
+
+        "atr_percent": volatility[
+            "atr_percent"
+        ],
+
+        "volatility_ratio": volatility[
+            "ratio"
+        ],
+
+        # ----------------------------------------------------
+        # VOLUME
+        # ----------------------------------------------------
+
+        "volume_status": volume_info[
+            "status"
+        ],
+
+        "volume_ratio": volume_info[
+            "ratio"
+        ],
+
+        "volume_available": volume_info[
+            "available"
+        ],
+
+        # ----------------------------------------------------
+        # SUPPORT / RESISTANCE
+        # ----------------------------------------------------
+
+        "support": sr[
+            "support"
+        ],
+
+        "support2": sr[
+            "support2"
+        ],
+
+        "resistance": sr[
+            "resistance"
+        ],
+
+        "resistance2": sr[
+            "resistance2"
+        ],
+
+        "support_distance_percent": safe_float(
+            support_distance_percent,
+            3
+        ),
+
+        "resistance_distance_percent": safe_float(
+            resistance_distance_percent,
+            3
+        ),
+
+        # ----------------------------------------------------
+        # PREVIOUS DAY
+        # ----------------------------------------------------
+
+        "previous_day_high": previous_day[
+            "high"
+        ],
+
+        "previous_day_low": previous_day[
+            "low"
+        ],
+
+        "previous_day_close": previous_day[
+            "close"
+        ],
+
+        "previous_day_date": previous_day[
+            "date"
+        ],
+
+        # ----------------------------------------------------
         # PIVOTS
-        # ====================================================
+        # ----------------------------------------------------
 
-        "pivot":
-            round_value(
-                pivots.get("pivot")
+        "pivot": pivots[
+            "pivot"
+        ],
+
+        "r1": pivots["r1"],
+
+        "r2": pivots["r2"],
+
+        "s1": pivots["s1"],
+
+        "s2": pivots["s2"],
+
+        # ----------------------------------------------------
+        # BREAKOUT
+        # ----------------------------------------------------
+
+        "breakout": breakout[
+            "status"
+        ],
+
+        "breakout_status": breakout[
+            "status"
+        ],
+
+        "breakout_level": breakout[
+            "breakout_level"
+        ],
+
+        "breakdown_level": breakout[
+            "breakdown_level"
+        ],
+
+        "breakout_confirmed": breakout[
+            "breakout_confirmed"
+        ],
+
+        "breakdown_confirmed": breakout[
+            "breakdown_confirmed"
+        ],
+
+        "breakout_strength": breakout[
+            "strength"
+        ],
+
+        "breakout_volume_confirmed": (
+            volume_info["available"] and
+            volume_info["ratio"] is not None and
+            volume_info["ratio"] >= 1.20
+        ),
+
+        # ----------------------------------------------------
+        # FALSE BREAKOUT
+        # ----------------------------------------------------
+
+        "false_breakout": false_breakout[
+            "false_breakout"
+        ],
+
+        "false_breakdown": false_breakout[
+            "false_breakdown"
+        ],
+
+        "false_breakout_status": false_breakout[
+            "status"
+        ],
+
+        # ----------------------------------------------------
+        # TRADE PLAN — FLAT
+        # ----------------------------------------------------
+
+        "trade_status": trade_plan[
+            "status"
+        ],
+
+        "entry": trade_plan[
+            "entry"
+        ],
+
+        "entry_low": trade_plan[
+            "entry_low"
+        ],
+
+        "entry_high": trade_plan[
+            "entry_high"
+        ],
+
+        "stop_loss": trade_plan[
+            "stop_loss"
+        ],
+
+        "target_1": trade_plan[
+            "target_1"
+        ],
+
+        "target_2": trade_plan[
+            "target_2"
+        ],
+
+        "trailing_stop": trade_plan[
+            "trailing_stop"
+        ],
+
+        "risk_points": trade_plan[
+            "risk_points"
+        ],
+
+        "reward_1_points": trade_plan[
+            "reward_1_points"
+        ],
+
+        "reward_2_points": trade_plan[
+            "reward_2_points"
+        ],
+
+        "risk_reward_1": trade_plan[
+            "risk_reward_1"
+        ],
+
+        "risk_reward_2": trade_plan[
+            "risk_reward_2"
+        ],
+
+        # ----------------------------------------------------
+        # ZONES
+        # ----------------------------------------------------
+
+        "entry_zone": zones[
+            "entry_zone"
+        ],
+
+        "avoid_zone": zones[
+            "avoid_zone"
+        ],
+
+        # ----------------------------------------------------
+        # MTF FLAT
+        # ----------------------------------------------------
+
+        "trend_15m": timeframe_data[
+            "15m"
+        ]["trend"],
+
+        "trend_30m": timeframe_data[
+            "30m"
+        ]["trend"],
+
+        "trend_1h": timeframe_data[
+            "1h"
+        ]["trend"],
+
+        "trend_daily": timeframe_data[
+            "1D"
+        ]["trend"],
+
+        "higher_timeframe_trend": timeframe_data[
+            "1h"
+        ]["trend"],
+
+        "higher_tf_conflict": htf_conflict,
+
+        "multi_timeframe_alignment": mtf_alignment,
+
+        # ----------------------------------------------------
+        # AI EXPLANATION
+        # ----------------------------------------------------
+
+        "analysis": analysis_text,
+
+        "analysis_text": analysis_text,
+
+        "bullish_reasons": signal_info[
+            "bullish_reasons"
+        ],
+
+        "bearish_reasons": signal_info[
+            "bearish_reasons"
+        ],
+
+        "no_trade_reason": signal_info[
+            "no_trade_reason"
+        ],
+
+        # ----------------------------------------------------
+        # TIMESTAMP
+        # ----------------------------------------------------
+
+        "timestamp": now_ist().isoformat(),
+
+        # ----------------------------------------------------
+        # NESTED FINAL OBJECTS
+        # ----------------------------------------------------
+
+        "indicators": indicators,
+
+        "levels": {
+            "support": sr["support"],
+            "support2": sr["support2"],
+            "resistance": sr["resistance"],
+            "resistance2": sr["resistance2"],
+            "previous_day_high": previous_day[
+                "high"
+            ],
+            "previous_day_low": previous_day[
+                "low"
+            ],
+            "previous_day_close": previous_day[
+                "close"
+            ],
+            "pivot": pivots["pivot"],
+            "r1": pivots["r1"],
+            "r2": pivots["r2"],
+            "s1": pivots["s1"],
+            "s2": pivots["s2"]
+        },
+
+        "trade": {
+            "status": trade_plan[
+                "status"
+            ],
+            "decision": decision,
+            "entry": trade_plan[
+                "entry"
+            ],
+            "entry_low": trade_plan[
+                "entry_low"
+            ],
+            "entry_high": trade_plan[
+                "entry_high"
+            ],
+            "stop_loss": trade_plan[
+                "stop_loss"
+            ],
+            "target_1": trade_plan[
+                "target_1"
+            ],
+            "target_2": trade_plan[
+                "target_2"
+            ],
+            "trailing_stop": trade_plan[
+                "trailing_stop"
+            ],
+            "risk_points": trade_plan[
+                "risk_points"
+            ],
+            "reward_1_points": trade_plan[
+                "reward_1_points"
+            ],
+            "reward_2_points": trade_plan[
+                "reward_2_points"
+            ],
+            "risk_reward_1": trade_plan[
+                "risk_reward_1"
+            ],
+            "risk_reward_2": trade_plan[
+                "risk_reward_2"
+            ],
+            "entry_zone": zones[
+                "entry_zone"
+            ],
+            "avoid_zone": zones[
+                "avoid_zone"
+            ]
+        },
+
+        "timeframes": {
+            "15m": timeframe_data[
+                "15m"
+            ],
+            "30m": timeframe_data[
+                "30m"
+            ],
+            "1h": timeframe_data[
+                "1h"
+            ],
+            "1D": timeframe_data[
+                "1D"
+            ],
+            "alignment": mtf_alignment,
+            "conflict": htf_conflict
+        },
+
+        "breakout_analysis": {
+            "status": breakout[
+                "status"
+            ],
+            "breakout_confirmed": breakout[
+                "breakout_confirmed"
+            ],
+            "breakdown_confirmed": breakout[
+                "breakdown_confirmed"
+            ],
+            "breakout_level": breakout[
+                "breakout_level"
+            ],
+            "breakdown_level": breakout[
+                "breakdown_level"
+            ],
+            "strength": breakout[
+                "strength"
+            ],
+            "volume_confirmed": (
+                volume_info["available"] and
+                volume_info["ratio"] is not None and
+                volume_info["ratio"] >= 1.20
             ),
+            "false_breakout": false_breakout[
+                "false_breakout"
+            ],
+            "false_breakdown": false_breakout[
+                "false_breakdown"
+            ]
+        },
 
-        "pivot_r1":
-            round_value(
-                pivots.get("pivot_r1")
-            ),
-
-        "pivot_s1":
-            round_value(
-                pivots.get("pivot_s1")
-            ),
-
-        "pivot_r2":
-            round_value(
-                pivots.get("pivot_r2")
-            ),
-
-        "pivot_s2":
-            round_value(
-                pivots.get("pivot_s2")
-            ),
-
-        # ====================================================
-        # EXTRA STATUS
-        # ====================================================
-
-        "volume_ratio":
-            round_value(
-                volume_info.get(
-                    "ratio"
-                ),
-                2
-            ),
-
-        "volume_available":
-            volume_info.get(
-                "available",
-                False
-            ),
-
-        "false_breakout":
-            false_breakout_data.get(
-                "false_breakout",
-                False
-            ),
-
-        "false_breakdown":
-            false_breakout_data.get(
-                "false_breakdown",
-                False
-            ),
-
-        "signal_quality":
-            signal_data.get(
-                "signal_quality",
-                "LOW"
-            ),
-
-        "no_trade_reason":
-            signal_data.get(
+        "ai": {
+            "decision": decision,
+            "confidence": confidence,
+            "quality": signal_info[
+                "quality"
+            ],
+            "bullish_score": signal_info[
+                "bullish_score"
+            ],
+            "bearish_score": signal_info[
+                "bearish_score"
+            ],
+            "net_score": signal_info[
+                "net_score"
+            ],
+            "market_regime": regime,
+            "market_structure": structure,
+            "mtf_alignment": mtf_alignment,
+            "htf_conflict": htf_conflict,
+            "analysis": analysis_text,
+            "no_trade_reason": signal_info[
                 "no_trade_reason"
-            )
+            ]
+        },
+
+        "system": {
+            "status": "ONLINE",
+            "data_source": (
+                "Yahoo Finance"
+            ),
+            "symbol": SYMBOL,
+            "backend_version": "FINAL-1.0",
+            "server_time": now_ist().isoformat()
+        }
     }
 
     return response
@@ -2791,9 +3906,12 @@ def root():
     return {
         "app": "NIFTY AI TRADER",
         "status": "running",
-        "version": "5.1",
+        "version": "FINAL-1.0",
         "symbol": "NIFTY 50",
-        "message": "NIFTY AI Trader backend is running."
+        "data_source": "Yahoo Finance (^NSEI)",
+        "message": (
+            "NIFTY AI Trader Final Backend is running."
+        )
     }
 
 
@@ -2806,8 +3924,24 @@ def health():
 
     return {
         "status": "ok",
-        "version": "5.1",
-        "time": datetime.utcnow().isoformat()
+        "version": "FINAL-1.0",
+        "time": now_ist().isoformat()
+    }
+
+
+# ============================================================
+# VERSION
+# ============================================================
+
+@app.get("/version")
+def version():
+
+    return {
+        "app": "NIFTY AI TRADER",
+        "version": "FINAL-1.0",
+        "backend": "FINAL",
+        "symbol": "NIFTY 50",
+        "data_source": "Yahoo Finance"
     }
 
 
@@ -2824,13 +3958,119 @@ def nifty():
 
 
 # ============================================================
-# HISTORY ENDPOINT
-# IMPORTANT: MUST BE BEFORE /nifty/{interval}
+# NIFTY SUMMARY
+# ============================================================
+
+@app.get("/nifty/summary")
+def nifty_summary():
+
+    data = build_analysis(
+        "5m"
+    )
+
+    return {
+        "symbol": data.get(
+            "symbol"
+        ),
+        "price": data.get(
+            "price"
+        ),
+        "change": data.get(
+            "change"
+        ),
+        "change_percent": data.get(
+            "change_percent"
+        ),
+        "market_status": data.get(
+            "market_status"
+        ),
+        "trend": data.get(
+            "trend"
+        ),
+        "decision": data.get(
+            "decision"
+        ),
+        "signal": data.get(
+            "signal"
+        ),
+        "confidence": data.get(
+            "confidence"
+        ),
+        "signal_quality": data.get(
+            "signal_quality"
+        ),
+        "bullish_score": data.get(
+            "bullish_score"
+        ),
+        "bearish_score": data.get(
+            "bearish_score"
+        ),
+        "support": data.get(
+            "support"
+        ),
+        "resistance": data.get(
+            "resistance"
+        ),
+        "entry": data.get(
+            "entry"
+        ),
+        "stop_loss": data.get(
+            "stop_loss"
+        ),
+        "target_1": data.get(
+            "target_1"
+        ),
+        "target_2": data.get(
+            "target_2"
+        ),
+        "risk_reward_1": data.get(
+            "risk_reward_1"
+        ),
+        "risk_reward_2": data.get(
+            "risk_reward_2"
+        ),
+        "analysis": data.get(
+            "analysis"
+        ),
+        "timestamp": data.get(
+            "timestamp"
+        )
+    }
+
+
+# ============================================================
+# ALL TIMEFRAMES
+# ============================================================
+
+@app.get("/nifty/all-timeframes")
+def nifty_all_timeframes():
+
+    timeframe_data = (
+        get_higher_timeframe_analysis()
+    )
+
+    return {
+        "symbol": "NIFTY 50",
+        "version": "FINAL-1.0",
+        "timeframes": timeframe_data,
+        "alignment": calculate_mtf_alignment(
+            timeframe_data
+        ),
+        "conflict": detect_htf_conflict(
+            timeframe_data
+        ),
+        "timestamp": now_ist().isoformat()
+    }
+
+
+# ============================================================
+# HISTORY
 # ============================================================
 
 @app.get("/nifty/history")
 def nifty_history(
-    interval: str = "5m"
+    interval: str = "5m",
+    limit: int = 250
 ):
 
     if interval not in INTERVAL_CONFIG:
@@ -2838,10 +4078,16 @@ def nifty_history(
         raise HTTPException(
             status_code=400,
             detail=(
-                "Invalid interval. "
-                "Use 1m, 5m, 15m, 30m, 1h or 1D."
+                f"Unsupported interval: {interval}. "
+                f"Supported: {list(INTERVAL_CONFIG.keys())}"
             )
         )
+
+    if limit < 1:
+        limit = 1
+
+    if limit > 1000:
+        limit = 1000
 
     df = fetch_history(
         interval
@@ -2851,49 +4097,47 @@ def nifty_history(
 
         raise HTTPException(
             status_code=503,
-            detail="Unable to fetch NIFTY history."
+            detail="No historical data available."
         )
+
+    df = df.tail(
+        limit
+    )
 
     candles = []
 
     for timestamp, row in df.iterrows():
 
-        candles.append({
-            "timestamp":
-                timestamp.isoformat(),
-
-            "open":
-                round_value(
+        candles.append(
+            {
+                "time": timestamp.isoformat(),
+                "timestamp": timestamp.isoformat(),
+                "open": safe_float(
                     row["Open"]
                 ),
-
-            "high":
-                round_value(
+                "high": safe_float(
                     row["High"]
                 ),
-
-            "low":
-                round_value(
+                "low": safe_float(
                     row["Low"]
                 ),
-
-            "close":
-                round_value(
+                "close": safe_float(
                     row["Close"]
                 ),
-
-            "volume":
-                round_value(
+                "volume": safe_float(
                     row["Volume"]
                 )
-        })
+            }
+        )
 
     return {
         "symbol": "NIFTY 50",
         "interval": interval,
         "count": len(candles),
+        "data": candles,
         "candles": candles,
-        "analysis_version": "V5.1"
+        "version": "FINAL-1.0",
+        "timestamp": now_ist().isoformat()
     }
 
 
@@ -2911,8 +4155,8 @@ def nifty_interval(
         raise HTTPException(
             status_code=400,
             detail=(
-                "Invalid interval. "
-                "Use 1m, 5m, 15m, 30m, 1h or 1D."
+                f"Unsupported interval: {interval}. "
+                f"Supported: {list(INTERVAL_CONFIG.keys())}"
             )
         )
 
@@ -2922,7 +4166,7 @@ def nifty_interval(
 
 
 # ============================================================
-# RUN
+# START SERVER
 # ============================================================
 
 if __name__ == "__main__":
@@ -2933,4 +4177,4 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=10000
-        )
+    )
