@@ -2,8 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import math
-import time
-from datetime import datetime, timedelta, timezone, time as dt_time
+from datetime import datetime, timezone, time as dt_time
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -17,7 +16,7 @@ import yfinance as yf
 
 app = FastAPI(
     title="Nifty AI Trader Backend",
-    version="4.0"
+    version="4.1"
 )
 
 app.add_middleware(
@@ -40,11 +39,8 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
 
-# We do NOT pretend old data is live.
-# Maximum acceptable age for LIVE status.
 MAX_LIVE_AGE_SECONDS = 90
 
-# Yahoo intraday limits can vary.
 INTERVAL_PERIODS = {
     "1m": "1d",
     "5m": "5d",
@@ -53,6 +49,15 @@ INTERVAL_PERIODS = {
     "1h": "3mo",
     "1D": "1y",
 }
+
+ALLOWED_INTERVALS = [
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "1D"
+]
 
 
 # ============================================================
@@ -101,46 +106,94 @@ def round_or_none(value, digits=2):
     return round(value, digits)
 
 
+# ============================================================
+# NORMALIZE YFINANCE DATA
+# ============================================================
+
 def normalize_columns(df):
-    """
-    yfinance may return normal columns or MultiIndex columns.
-    Convert both formats into simple OHLCV columns.
-    """
 
     if df is None or df.empty:
         return df
 
     result = df.copy()
 
+    # --------------------------------------------------------
+    # Handle MultiIndex returned by some yfinance versions
+    # --------------------------------------------------------
+
     if isinstance(result.columns, pd.MultiIndex):
+
         new_columns = []
 
         for col in result.columns:
+
             if isinstance(col, tuple):
-                new_columns.append(str(col[0]))
+
+                # Find the OHLCV field inside the tuple.
+                selected = None
+
+                for item in col:
+
+                    text = str(item).strip().lower()
+
+                    if text in [
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "adj close",
+                        "volume"
+                    ]:
+                        selected = text
+                        break
+
+                if selected is None:
+                    selected = str(col[0])
+
+                new_columns.append(selected)
+
             else:
                 new_columns.append(str(col))
 
         result.columns = new_columns
+
+    # --------------------------------------------------------
+    # Normalize column names
+    # --------------------------------------------------------
 
     result.columns = [
         str(c).strip().lower()
         for c in result.columns
     ]
 
-    rename_map = {
-        "adj close": "adj_close"
-    }
+    result = result.rename(
+        columns={
+            "adj close": "adj_close"
+        }
+    )
 
-    result = result.rename(columns=rename_map)
+    # --------------------------------------------------------
+    # Required columns
+    # --------------------------------------------------------
 
-    required = ["open", "high", "low", "close"]
+    required = [
+        "open",
+        "high",
+        "low",
+        "close"
+    ]
 
     for column in required:
+
         if column not in result.columns:
+
             raise ValueError(
                 f"Missing required column: {column}"
             )
+
+    # --------------------------------------------------------
+    # Volume
+    # --------------------------------------------------------
 
     if "volume" not in result.columns:
         result["volume"] = np.nan
@@ -153,12 +206,18 @@ def normalize_columns(df):
 # ============================================================
 
 def fetch_history(interval="5m"):
+
     if interval not in INTERVAL_PERIODS:
-        interval = "5m"
+
+        raise ValueError(
+            "Invalid interval. "
+            "Use 1m, 5m, 15m, 30m, 1h or 1D."
+        )
 
     period = INTERVAL_PERIODS[interval]
 
     try:
+
         df = yf.download(
             SYMBOL,
             period=period,
@@ -169,45 +228,104 @@ def fetch_history(interval="5m"):
         )
 
     except Exception as exc:
+
         raise RuntimeError(
             f"Market data download failed: {exc}"
         )
 
     if df is None or df.empty:
+
         raise RuntimeError(
             "No market data returned by data provider."
         )
 
     df = normalize_columns(df)
 
-    # Remove rows without close
-    df = df.dropna(subset=["close"])
+    # --------------------------------------------------------
+    # Convert OHLCV to numeric
+    # --------------------------------------------------------
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+    ]:
+
+        if column in df.columns:
+
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
+
+    # --------------------------------------------------------
+    # Remove invalid candles
+    # --------------------------------------------------------
+
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close"
+        ]
+    )
 
     if df.empty:
+
         raise RuntimeError(
             "Market data contains no valid candles."
         )
 
+    # --------------------------------------------------------
+    # Sort chronologically
+    # --------------------------------------------------------
+
+    df = df.sort_index()
+
     return df
 
 
+# ============================================================
+# TIMESTAMP HELPERS
+# ============================================================
+
 def get_latest_timestamp(df):
+
     if df is None or df.empty:
         return None
 
     ts = df.index[-1]
 
     try:
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("UTC")
 
-        return ts.to_pydatetime().astimezone(IST)
+        if isinstance(ts, pd.Timestamp):
+
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+
+            return ts.to_pydatetime().astimezone(IST)
+
+        if isinstance(ts, datetime):
+
+            if ts.tzinfo is None:
+                ts = ts.replace(
+                    tzinfo=timezone.utc
+                )
+
+            return ts.astimezone(IST)
+
+        return None
 
     except Exception:
+
         return None
 
 
 def get_data_age_seconds(df):
+
     latest = get_latest_timestamp(df)
 
     if latest is None:
@@ -215,10 +333,14 @@ def get_data_age_seconds(df):
 
     current = now_ist()
 
-    age = (current - latest).total_seconds()
+    age = (
+        current - latest
+    ).total_seconds()
 
-    # Prevent negative age caused by clock differences.
-    return max(0.0, age)
+    return max(
+        0.0,
+        age
+    )
 
 
 # ============================================================
@@ -226,54 +348,82 @@ def get_data_age_seconds(df):
 # ============================================================
 
 def calculate_market_status(df):
-    """
-    IMPORTANT:
-    LIVE means:
-      1. Current time is during Indian market hours
-      2. Latest candle is recent enough
-
-    We do not simply assume LIVE.
-    """
 
     current = now_ist()
 
-    market_session = is_market_hours(current)
+    market_session = is_market_hours(
+        current
+    )
 
-    latest_timestamp = get_latest_timestamp(df)
+    latest_timestamp = get_latest_timestamp(
+        df
+    )
 
-    age_seconds = get_data_age_seconds(df)
+    age_seconds = get_data_age_seconds(
+        df
+    )
 
     if latest_timestamp is None:
+
         return {
             "market_status": "UNKNOWN",
             "data_age_seconds": None,
             "latest_data_time": None
         }
 
+    # --------------------------------------------------------
+    # Market closed
+    # --------------------------------------------------------
+
     if not market_session:
+
         return {
             "market_status": "CLOSED",
-            "data_age_seconds": round(age_seconds, 1)
-            if age_seconds is not None else None,
-            "latest_data_time": latest_timestamp.isoformat()
+            "data_age_seconds":
+                round(age_seconds, 1)
+                if age_seconds is not None
+                else None,
+
+            "latest_data_time":
+                latest_timestamp.isoformat()
         }
 
+    # --------------------------------------------------------
+    # Unknown age
+    # --------------------------------------------------------
+
     if age_seconds is None:
+
         return {
             "market_status": "UNKNOWN",
             "data_age_seconds": None,
-            "latest_data_time": latest_timestamp.isoformat()
+            "latest_data_time":
+                latest_timestamp.isoformat()
         }
 
+    # --------------------------------------------------------
+    # Live / delayed
+    # --------------------------------------------------------
+
     if age_seconds <= MAX_LIVE_AGE_SECONDS:
+
         status = "LIVE"
+
     else:
+
         status = "DELAYED"
 
     return {
         "market_status": status,
-        "data_age_seconds": round(age_seconds, 1),
-        "latest_data_time": latest_timestamp.isoformat()
+
+        "data_age_seconds":
+            round(
+                age_seconds,
+                1
+            ),
+
+        "latest_data_time":
+            latest_timestamp.isoformat()
     }
 
 
@@ -282,6 +432,7 @@ def calculate_market_status(df):
 # ============================================================
 
 def calculate_indicators(df):
+
     result = df.copy()
 
     close = result["close"]
@@ -292,9 +443,17 @@ def calculate_indicators(df):
     # Moving averages
     # --------------------------------------------------------
 
-    result["ma_5"] = close.rolling(5).mean()
-    result["ma_10"] = close.rolling(10).mean()
-    result["ma_20"] = close.rolling(20).mean()
+    result["ma_5"] = close.rolling(
+        5
+    ).mean()
+
+    result["ma_10"] = close.rolling(
+        10
+    ).mean()
+
+    result["ma_20"] = close.rolling(
+        20
+    ).mean()
 
     # --------------------------------------------------------
     # EMA
@@ -331,8 +490,13 @@ def calculate_indicators(df):
 
     delta = close.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
 
     avg_gain = gain.ewm(
         alpha=1 / 14,
@@ -344,10 +508,20 @@ def calculate_indicators(df):
         adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = (
+        avg_gain /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
+    )
 
-    result["rsi_14"] = 100 - (
-        100 / (1 + rs)
+    result["rsi_14"] = (
+        100 -
+        (
+            100 /
+            (1 + rs)
+        )
     )
 
     # --------------------------------------------------------
@@ -364,12 +538,16 @@ def calculate_indicators(df):
         adjust=False
     ).mean()
 
-    result["macd"] = ema12 - ema26
+    result["macd"] = (
+        ema12 - ema26
+    )
 
-    result["macd_signal"] = result["macd"].ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    result["macd_signal"] = (
+        result["macd"].ewm(
+            span=9,
+            adjust=False
+        ).mean()
+    )
 
     result["macd_histogram"] = (
         result["macd"] -
@@ -380,52 +558,91 @@ def calculate_indicators(df):
     # Momentum
     # --------------------------------------------------------
 
-    result["momentum"] = close.diff(10)
+    result["momentum"] = close.diff(
+        10
+    )
 
     # --------------------------------------------------------
     # ATR
     # --------------------------------------------------------
 
-    previous_close = close.shift(1)
+    previous_close = close.shift(
+        1
+    )
 
     tr1 = high - low
-    tr2 = (high - previous_close).abs()
-    tr3 = (low - previous_close).abs()
+
+    tr2 = (
+        high -
+        previous_close
+    ).abs()
+
+    tr3 = (
+        low -
+        previous_close
+    ).abs()
 
     true_range = pd.concat(
-        [tr1, tr2, tr3],
+        [
+            tr1,
+            tr2,
+            tr3
+        ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
-    result["atr_14"] = true_range.rolling(14).mean()
+    result["atr_14"] = (
+        true_range.rolling(
+            14
+        ).mean()
+    )
 
     # --------------------------------------------------------
     # ADX
     # --------------------------------------------------------
 
     up_move = high.diff()
+
     down_move = -low.diff()
 
     plus_dm = np.where(
-        (up_move > down_move) & (up_move > 0),
+        (
+            up_move >
+            down_move
+        ) &
+        (
+            up_move > 0
+        ),
         up_move,
         0
     )
 
     minus_dm = np.where(
-        (down_move > up_move) & (down_move > 0),
+        (
+            down_move >
+            up_move
+        ) &
+        (
+            down_move > 0
+        ),
         down_move,
         0
     )
 
-    atr14 = result["atr_14"]
+    atr14 = result[
+        "atr_14"
+    ]
 
     plus_di = (
         100 *
         pd.Series(
             plus_dm,
             index=result.index
-        ).rolling(14).mean() /
+        ).rolling(
+            14
+        ).mean() /
         atr14
     )
 
@@ -434,17 +651,32 @@ def calculate_indicators(df):
         pd.Series(
             minus_dm,
             index=result.index
-        ).rolling(14).mean() /
+        ).rolling(
+            14
+        ).mean() /
         atr14
     )
 
     dx = (
         100 *
-        (plus_di - minus_di).abs() /
-        (plus_di + minus_di).replace(0, np.nan)
+        (
+            plus_di -
+            minus_di
+        ).abs() /
+        (
+            plus_di +
+            minus_di
+        ).replace(
+            0,
+            np.nan
+        )
     )
 
-    result["adx_14"] = dx.rolling(14).mean()
+    result["adx_14"] = (
+        dx.rolling(
+            14
+        ).mean()
+    )
 
     # --------------------------------------------------------
     # VWAP
@@ -456,17 +688,24 @@ def calculate_indicators(df):
         close
     ) / 3
 
-    volume = result["volume"].fillna(0)
+    volume = (
+        result["volume"]
+        .fillna(0)
+    )
 
-    cumulative_volume = volume.cumsum()
+    cumulative_volume = (
+        volume.cumsum()
+    )
 
     cumulative_value = (
-        typical_price * volume
+        typical_price *
+        volume
     ).cumsum()
 
     result["vwap"] = np.where(
         cumulative_volume > 0,
-        cumulative_value / cumulative_volume,
+        cumulative_value /
+        cumulative_volume,
         typical_price
     )
 
@@ -479,17 +718,30 @@ def calculate_indicators(df):
     # Bollinger Bands
     # --------------------------------------------------------
 
-    middle = close.rolling(20).mean()
-    std = close.rolling(20).std()
+    middle = close.rolling(
+        20
+    ).mean()
 
-    result["bollinger_middle"] = middle
+    std = close.rolling(
+        20
+    ).std()
 
-    result["bollinger_upper"] = (
-        middle + 2 * std
+    result[
+        "bollinger_middle"
+    ] = middle
+
+    result[
+        "bollinger_upper"
+    ] = (
+        middle +
+        2 * std
     )
 
-    result["bollinger_lower"] = (
-        middle - 2 * std
+    result[
+        "bollinger_lower"
+    ] = (
+        middle -
+        2 * std
     )
 
     return result
@@ -500,22 +752,39 @@ def calculate_indicators(df):
 # ============================================================
 
 def calculate_support_resistance(df):
+
     recent = df.tail(50)
 
     support = safe_float(
-        recent["low"].rolling(10).min().iloc[-1]
+        recent[
+            "low"
+        ].rolling(
+            10
+        ).min().iloc[-1]
     )
 
     resistance = safe_float(
-        recent["high"].rolling(10).max().iloc[-1]
+        recent[
+            "high"
+        ].rolling(
+            10
+        ).max().iloc[-1]
     )
 
     support2 = safe_float(
-        recent["low"].rolling(20).min().iloc[-1]
+        recent[
+            "low"
+        ].rolling(
+            20
+        ).min().iloc[-1]
     )
 
     resistance2 = safe_float(
-        recent["high"].rolling(20).max().iloc[-1]
+        recent[
+            "high"
+        ].rolling(
+            20
+        ).max().iloc[-1]
     )
 
     return (
@@ -531,7 +800,11 @@ def calculate_support_resistance(df):
 # ============================================================
 
 def calculate_volume_status(df):
-    volume = df["volume"].dropna()
+
+    volume = (
+        df["volume"]
+        .dropna()
+    )
 
     if volume.empty:
         return "UNAVAILABLE", None
@@ -539,7 +812,9 @@ def calculate_volume_status(df):
     if len(volume) < 20:
         return "UNAVAILABLE", None
 
-    latest_volume = safe_float(volume.iloc[-1])
+    latest_volume = safe_float(
+        volume.iloc[-1]
+    )
 
     average_volume = safe_float(
         volume.tail(20).mean()
@@ -550,9 +825,13 @@ def calculate_volume_status(df):
         average_volume is None or
         average_volume <= 0
     ):
+
         return "UNAVAILABLE", None
 
-    ratio = latest_volume / average_volume
+    ratio = (
+        latest_volume /
+        average_volume
+    )
 
     if ratio >= 1.5:
         status = "HIGH"
@@ -563,7 +842,13 @@ def calculate_volume_status(df):
     else:
         status = "NORMAL"
 
-    return status, round(ratio, 2)
+    return (
+        status,
+        round(
+            ratio,
+            2
+        )
+    )
 
 
 # ============================================================
@@ -571,11 +856,22 @@ def calculate_volume_status(df):
 # ============================================================
 
 def calculate_trend(row):
-    close = safe_float(row["close"])
 
-    ema9 = safe_float(row["ema_9"])
-    ema20 = safe_float(row["ema_20"])
-    ema50 = safe_float(row["ema_50"])
+    close = safe_float(
+        row["close"]
+    )
+
+    ema9 = safe_float(
+        row["ema_9"]
+    )
+
+    ema20 = safe_float(
+        row["ema_20"]
+    )
+
+    ema50 = safe_float(
+        row["ema_50"]
+    )
 
     if None in (
         close,
@@ -583,6 +879,7 @@ def calculate_trend(row):
         ema20,
         ema50
     ):
+
         return "SIDEWAYS"
 
     bullish = (
@@ -619,24 +916,48 @@ def generate_signal(
     resistance2
 ):
 
-    close = safe_float(row["close"])
+    close = safe_float(
+        row["close"]
+    )
 
-    ema9 = safe_float(row["ema_9"])
-    ema20 = safe_float(row["ema_20"])
-    ema50 = safe_float(row["ema_50"])
+    ema9 = safe_float(
+        row["ema_9"]
+    )
 
-    rsi = safe_float(row["rsi_14"])
+    ema20 = safe_float(
+        row["ema_20"]
+    )
 
-    macd = safe_float(row["macd"])
-    macd_signal = safe_float(row["macd_signal"])
+    ema50 = safe_float(
+        row["ema_50"]
+    )
 
-    momentum = safe_float(row["momentum"])
+    rsi = safe_float(
+        row["rsi_14"]
+    )
 
-    vwap = safe_float(row["vwap"])
+    macd = safe_float(
+        row["macd"]
+    )
 
-    adx = safe_float(row["adx_14"])
+    macd_signal = safe_float(
+        row["macd_signal"]
+    )
+
+    momentum = safe_float(
+        row["momentum"]
+    )
+
+    vwap = safe_float(
+        row["vwap"]
+    )
+
+    adx = safe_float(
+        row["adx_14"]
+    )
 
     if close is None:
+
         return {
             "signal": "NEUTRAL",
             "signal_strength": "LOW",
@@ -646,7 +967,10 @@ def generate_signal(
             "reasons": [],
             "warnings": [
                 "No valid price data"
-            ]
+            ],
+            "breakout_confirmed": False,
+            "breakdown_confirmed": False,
+            "trend": "SIDEWAYS"
         }
 
     bullish_score = 0
@@ -659,30 +983,44 @@ def generate_signal(
     # EMA
     # --------------------------------------------------------
 
-    if ema9 is not None and ema20 is not None:
+    if (
+        ema9 is not None and
+        ema20 is not None
+    ):
 
         if ema9 > ema20:
+
             bullish_score += 1
+
             bullish_reasons.append(
                 "EMA9 above EMA20"
             )
 
         elif ema9 < ema20:
+
             bearish_score += 1
+
             bearish_reasons.append(
                 "EMA9 below EMA20"
             )
 
-    if ema20 is not None and ema50 is not None:
+    if (
+        ema20 is not None and
+        ema50 is not None
+    ):
 
         if ema20 > ema50:
+
             bullish_score += 1
+
             bullish_reasons.append(
                 "EMA20 above EMA50"
             )
 
         elif ema20 < ema50:
+
             bearish_score += 1
+
             bearish_reasons.append(
                 "EMA20 below EMA50"
             )
@@ -694,13 +1032,17 @@ def generate_signal(
     if rsi is not None:
 
         if rsi >= 55:
+
             bullish_score += 2
+
             bullish_reasons.append(
                 "RSI bullish"
             )
 
         elif rsi <= 45:
+
             bearish_score += 2
+
             bearish_reasons.append(
                 "RSI bearish"
             )
@@ -715,13 +1057,17 @@ def generate_signal(
     ):
 
         if macd > macd_signal:
+
             bullish_score += 2
+
             bullish_reasons.append(
                 "MACD bullish"
             )
 
         else:
+
             bearish_score += 2
+
             bearish_reasons.append(
                 "MACD bearish"
             )
@@ -733,13 +1079,17 @@ def generate_signal(
     if vwap is not None:
 
         if close > vwap:
+
             bullish_score += 2
+
             bullish_reasons.append(
                 "Price above VWAP"
             )
 
         else:
+
             bearish_score += 2
+
             bearish_reasons.append(
                 "Price below VWAP"
             )
@@ -751,13 +1101,17 @@ def generate_signal(
     if momentum is not None:
 
         if momentum > 0:
+
             bullish_score += 1
+
             bullish_reasons.append(
                 "Positive momentum"
             )
 
         elif momentum < 0:
+
             bearish_score += 1
+
             bearish_reasons.append(
                 "Negative momentum"
             )
@@ -781,8 +1135,11 @@ def generate_signal(
     if resistance is not None:
 
         if close > resistance:
+
             breakout_confirmed = True
+
             bullish_score += 3
+
             bullish_reasons.append(
                 "Resistance breakout"
             )
@@ -790,14 +1147,17 @@ def generate_signal(
     if support is not None:
 
         if close < support:
+
             breakdown_confirmed = True
+
             bearish_score += 3
+
             bearish_reasons.append(
                 "Support breakdown"
             )
 
     # --------------------------------------------------------
-    # Signal
+    # Confidence
     # --------------------------------------------------------
 
     difference = abs(
@@ -811,8 +1171,11 @@ def generate_signal(
     )
 
     if total_score <= 0:
+
         confidence = 50.0
+
     else:
+
         confidence = (
             max(
                 bullish_score,
@@ -822,29 +1185,30 @@ def generate_signal(
         ) * 100
 
     confidence = round(
-        max(0, min(100, confidence)),
+        max(
+            0,
+            min(
+                100,
+                confidence
+            )
+        ),
         1
     )
+
+    # --------------------------------------------------------
+    # Signal
+    # --------------------------------------------------------
 
     signal = "NEUTRAL"
     strength = "LOW"
 
-    # --------------------------------------------------------
-    # IMPORTANT:
-    # Do not issue BUY/SELL when data isn't LIVE.
-    # --------------------------------------------------------
-
-    if market_status != "LIVE":
-
-        signal = "NEUTRAL"
-        strength = "LOW"
-
-    else:
+    if market_status == "LIVE":
 
         if (
             bullish_score >= 7 and
             difference >= 3
         ):
+
             signal = "BUY"
 
             strength = (
@@ -857,6 +1221,7 @@ def generate_signal(
             bearish_score >= 7 and
             difference >= 3
         ):
+
             signal = "SELL"
 
             strength = (
@@ -866,56 +1231,86 @@ def generate_signal(
             )
 
     # --------------------------------------------------------
-    # Correct trend calculation
+    # Trend
     # --------------------------------------------------------
 
-    trend = calculate_trend(row)
-
-    # DO NOT add incorrect "Strong bullish trend"
-    # when trend is SIDEWAYS.
+    trend = calculate_trend(
+        row
+    )
 
     if trend == "BULLISH":
+
         trend_reason = "Bullish trend"
 
     elif trend == "BEARISH":
+
         trend_reason = "Bearish trend"
 
     else:
+
         trend_reason = "Sideways trend"
 
     # --------------------------------------------------------
     # Reasons
     # --------------------------------------------------------
 
-    reasons = []
+    if bullish_score >= bearish_score:
 
-    reasons.extend(
-        bullish_reasons
-        if bullish_score >= bearish_score
-        else bearish_reasons
-    )
+        reasons = bullish_reasons
+
+    else:
+
+        reasons = bearish_reasons
 
     if not reasons:
-        reasons = [trend_reason]
+
+        reasons = [
+            trend_reason
+        ]
+
+    # --------------------------------------------------------
+    # Warnings
+    # --------------------------------------------------------
 
     warnings = []
 
     if market_status != "LIVE":
+
         warnings.append(
             f"Market data status: {market_status}"
         )
 
     return {
-        "signal": signal,
-        "signal_strength": strength,
-        "confidence": confidence,
-        "bullish_score": bullish_score,
-        "bearish_score": bearish_score,
-        "reasons": reasons,
-        "warnings": warnings,
-        "breakout_confirmed": breakout_confirmed,
-        "breakdown_confirmed": breakdown_confirmed,
-        "trend": trend
+
+        "signal":
+            signal,
+
+        "signal_strength":
+            strength,
+
+        "confidence":
+            confidence,
+
+        "bullish_score":
+            bullish_score,
+
+        "bearish_score":
+            bearish_score,
+
+        "reasons":
+            reasons,
+
+        "warnings":
+            warnings,
+
+        "breakout_confirmed":
+            breakout_confirmed,
+
+        "breakdown_confirmed":
+            breakdown_confirmed,
+
+        "trend":
+            trend
     }
 
 
@@ -930,32 +1325,58 @@ def create_trade_plan(
     resistance
 ):
 
-    signal = signal_data["signal"]
+    signal = signal_data[
+        "signal"
+    ]
 
-    close = safe_float(row["close"])
-    atr = safe_float(row["atr_14"])
+    close = safe_float(
+        row["close"]
+    )
 
-    # Never create trade plan without valid values.
+    atr = safe_float(
+        row["atr_14"]
+    )
+
     if (
-        signal not in ("BUY", "SELL") or
-        close is None or
-        atr is None or
+        signal not in (
+            "BUY",
+            "SELL"
+        )
+        or
+        close is None
+        or
+        atr is None
+        or
         atr <= 0
     ):
 
         return {
-            "trade_status": "NO TRADE",
+
+            "trade_status":
+                "NO TRADE",
+
             "entry": None,
+
             "stop_loss": None,
+
             "target_1": None,
+
             "target_2": None,
+
             "risk_points": None,
+
             "reward_1_points": None,
+
             "reward_2_points": None,
+
             "risk_reward_1": None,
+
             "risk_reward_2": None,
+
             "trailing_stop": None,
+
             "entry_zone": None,
+
             "avoid_zone": None
         }
 
@@ -967,16 +1388,25 @@ def create_trade_plan(
 
         entry = close
 
-        stop_loss = entry - (
-            atr * 1.2
+        stop_loss = (
+            entry -
+            (
+                atr * 1.2
+            )
         )
 
-        target1 = entry + (
-            atr * 1.8
+        target1 = (
+            entry +
+            (
+                atr * 1.8
+            )
         )
 
-        target2 = entry + (
-            atr * 2.8
+        target2 = (
+            entry +
+            (
+                atr * 2.8
+            )
         )
 
     # --------------------------------------------------------
@@ -987,16 +1417,25 @@ def create_trade_plan(
 
         entry = close
 
-        stop_loss = entry + (
-            atr * 1.2
+        stop_loss = (
+            entry +
+            (
+                atr * 1.2
+            )
         )
 
-        target1 = entry - (
-            atr * 1.8
+        target1 = (
+            entry -
+            (
+                atr * 1.8
+            )
         )
 
-        target2 = entry - (
-            atr * 2.8
+        target2 = (
+            entry -
+            (
+                atr * 2.8
+            )
         )
 
     risk = abs(
@@ -1027,31 +1466,85 @@ def create_trade_plan(
     )
 
     entry_zone = (
-        f"{entry - atr * 0.15:.2f} - "
+        f"{entry - atr * 0.15:.2f}"
+        f" - "
         f"{entry + atr * 0.15:.2f}"
     )
 
-    avoid_zone = None
-
     return {
-        "trade_status": "TRADE SETUP",
-        "entry": round(entry, 2),
-        "stop_loss": round(stop_loss, 2),
-        "target_1": round(target1, 2),
-        "target_2": round(target2, 2),
-        "risk_points": round(risk, 2),
-        "reward_1_points": round(reward1, 2),
-        "reward_2_points": round(reward2, 2),
-        "risk_reward_1": round(rr1, 2)
-        if rr1 is not None else None,
-        "risk_reward_2": round(rr2, 2)
-        if rr2 is not None else None,
-        "trailing_stop": round(
-            atr * 1.0,
-            2
-        ),
-        "entry_zone": entry_zone,
-        "avoid_zone": avoid_zone
+
+        "trade_status":
+            "TRADE SETUP",
+
+        "entry":
+            round(
+                entry,
+                2
+            ),
+
+        "stop_loss":
+            round(
+                stop_loss,
+                2
+            ),
+
+        "target_1":
+            round(
+                target1,
+                2
+            ),
+
+        "target_2":
+            round(
+                target2,
+                2
+            ),
+
+        "risk_points":
+            round(
+                risk,
+                2
+            ),
+
+        "reward_1_points":
+            round(
+                reward1,
+                2
+            ),
+
+        "reward_2_points":
+            round(
+                reward2,
+                2
+            ),
+
+        "risk_reward_1":
+            round(
+                rr1,
+                2
+            )
+            if rr1 is not None
+            else None,
+
+        "risk_reward_2":
+            round(
+                rr2,
+                2
+            )
+            if rr2 is not None
+            else None,
+
+        "trailing_stop":
+            round(
+                atr * 1.0,
+                2
+            ),
+
+        "entry_zone":
+            entry_zone,
+
+        "avoid_zone":
+            None
     }
 
 
@@ -1061,43 +1554,78 @@ def create_trade_plan(
 
 def build_analysis(interval="5m"):
 
-    df = fetch_history(interval)
+    df = fetch_history(
+        interval
+    )
 
-    df = calculate_indicators(df)
+    df = calculate_indicators(
+        df
+    )
 
     row = df.iloc[-1]
 
-    market_info = calculate_market_status(df)
+    market_info = calculate_market_status(
+        df
+    )
 
     market_status = market_info[
         "market_status"
     ]
 
-    support, support2, resistance, resistance2 = (
-        calculate_support_resistance(df)
+    (
+        support,
+        support2,
+        resistance,
+        resistance2
+    ) = calculate_support_resistance(
+        df
     )
 
-    volume_status, volume_ratio = (
-        calculate_volume_status(df)
+    (
+        volume_status,
+        volume_ratio
+    ) = calculate_volume_status(
+        df
     )
 
     signal_data = generate_signal(
+
         row=row,
-        market_status=market_status,
-        support=support,
-        resistance=resistance,
-        support2=support2,
-        resistance2=resistance2
+
+        market_status=
+            market_status,
+
+        support=
+            support,
+
+        resistance=
+            resistance,
+
+        support2=
+            support2,
+
+        resistance2=
+            resistance2
     )
 
     trade_plan = create_trade_plan(
-        signal_data=signal_data,
-        row=row,
-        support=support,
-        resistance=resistance
+
+        signal_data=
+            signal_data,
+
+        row=
+            row,
+
+        support=
+            support,
+
+        resistance=
+            resistance
     )
 
-    price = safe_float(row["close"])
+    price = safe_float(
+        row["close"]
+    )
 
     # --------------------------------------------------------
     # Previous close
@@ -1106,6 +1634,7 @@ def build_analysis(interval="5m"):
     previous_close = None
 
     if len(df) >= 2:
+
         previous_close = safe_float(
             df["close"].iloc[-2]
         )
@@ -1119,7 +1648,10 @@ def build_analysis(interval="5m"):
         previous_close != 0
     ):
 
-        change = price - previous_close
+        change = (
+            price -
+            previous_close
+        )
 
         change_percent = (
             change /
@@ -1134,26 +1666,37 @@ def build_analysis(interval="5m"):
 
     try:
 
-        higher_df = fetch_history("15m")
+        higher_df = fetch_history(
+            "15m"
+        )
 
         higher_df = calculate_indicators(
             higher_df
         )
 
-        higher_row = higher_df.iloc[-1]
+        higher_row = (
+            higher_df.iloc[-1]
+        )
 
-        higher_tf_trend = calculate_trend(
-            higher_row
+        higher_tf_trend = (
+            calculate_trend(
+                higher_row
+            )
         )
 
     except Exception:
+
         higher_tf_trend = "SIDEWAYS"
 
-    trend = signal_data["trend"]
+    trend = signal_data[
+        "trend"
+    ]
 
     higher_tf_conflict = (
-        trend != "SIDEWAYS" and
-        higher_tf_trend != "SIDEWAYS" and
+        trend != "SIDEWAYS"
+        and
+        higher_tf_trend != "SIDEWAYS"
+        and
         trend != higher_tf_trend
     )
 
@@ -1162,40 +1705,59 @@ def build_analysis(interval="5m"):
     # --------------------------------------------------------
 
     support_distance_percent = None
+
     resistance_distance_percent = None
 
     if (
-        price is not None and
-        support is not None and
+        price is not None
+        and
+        support is not None
+        and
         price != 0
     ):
+
         support_distance_percent = (
-            abs(price - support) /
+            abs(
+                price -
+                support
+            ) /
             price
         ) * 100
 
     if (
-        price is not None and
-        resistance is not None and
+        price is not None
+        and
+        resistance is not None
+        and
         price != 0
     ):
+
         resistance_distance_percent = (
-            abs(resistance - price) /
+            abs(
+                resistance -
+                price
+            ) /
             price
         ) * 100
 
     near_support = (
-        support_distance_percent is not None and
-        support_distance_percent <= 0.15
+        support_distance_percent
+        is not None
+        and
+        support_distance_percent
+        <= 0.15
     )
 
     near_resistance = (
-        resistance_distance_percent is not None and
-        resistance_distance_percent <= 0.15
+        resistance_distance_percent
+        is not None
+        and
+        resistance_distance_percent
+        <= 0.15
     )
 
     # --------------------------------------------------------
-    # False breakout detection
+    # False breakout
     # --------------------------------------------------------
 
     false_breakout = False
@@ -1203,8 +1765,13 @@ def build_analysis(interval="5m"):
 
     if len(df) >= 3:
 
-        previous_candle = df.iloc[-2]
-        current_candle = df.iloc[-1]
+        previous_candle = (
+            df.iloc[-2]
+        )
+
+        current_candle = (
+            df.iloc[-1]
+        )
 
         prev_close = safe_float(
             previous_candle["close"]
@@ -1215,27 +1782,35 @@ def build_analysis(interval="5m"):
         )
 
         if (
-            resistance is not None and
-            prev_close is not None and
+            resistance is not None
+            and
+            prev_close is not None
+            and
             current_close is not None
         ):
 
             if (
-                prev_close > resistance and
+                prev_close > resistance
+                and
                 current_close < resistance
             ):
+
                 false_breakout = True
 
         if (
-            support is not None and
-            prev_close is not None and
+            support is not None
+            and
+            prev_close is not None
+            and
             current_close is not None
         ):
 
             if (
-                prev_close < support and
+                prev_close < support
+                and
                 current_close > support
             ):
+
                 false_breakdown = True
 
     # --------------------------------------------------------
@@ -1249,9 +1824,16 @@ def build_analysis(interval="5m"):
         )
     )
 
-    if volume_status == "UNAVAILABLE":
+    if (
+        volume_status ==
+        "UNAVAILABLE"
+    ):
 
-        if "Volume data unavailable" not in warnings:
+        if (
+            "Volume data unavailable"
+            not in warnings
+        ):
+
             warnings.append(
                 "Volume data unavailable"
             )
@@ -1260,31 +1842,46 @@ def build_analysis(interval="5m"):
     # Final response
     # --------------------------------------------------------
 
-    response = {
+    return {
 
-        "symbol": "NIFTY 50",
+        "symbol":
+            "NIFTY 50",
 
-        "price": round_or_none(price),
+        "price":
+            round_or_none(
+                price
+            ),
 
-        "previous_close": round_or_none(
-            previous_close
-        ),
+        "previous_close":
+            round_or_none(
+                previous_close
+            ),
 
-        "change": round_or_none(change),
+        "change":
+            round_or_none(
+                change
+            ),
 
-        "change_percent": round_or_none(
-            change_percent
-        ),
+        "change_percent":
+            round_or_none(
+                change_percent
+            ),
 
-        "market_status": market_status,
+        "market_status":
+            market_status,
 
         "data_age_seconds":
-            market_info["data_age_seconds"],
+            market_info[
+                "data_age_seconds"
+            ],
 
         "latest_data_time":
-            market_info["latest_data_time"],
+            market_info[
+                "latest_data_time"
+            ],
 
-        "trend": trend,
+        "trend":
+            trend,
 
         "higher_timeframe_trend":
             higher_tf_trend,
@@ -1293,95 +1890,109 @@ def build_analysis(interval="5m"):
             higher_tf_conflict,
 
         "signal":
-            signal_data["signal"],
+            signal_data[
+                "signal"
+            ],
 
         "signal_strength":
-            signal_data["signal_strength"],
+            signal_data[
+                "signal_strength"
+            ],
 
         "confidence":
-            signal_data["confidence"],
+            signal_data[
+                "confidence"
+            ],
 
         "bullish_score":
-            signal_data["bullish_score"],
+            signal_data[
+                "bullish_score"
+            ],
 
         "bearish_score":
-            signal_data["bearish_score"],
+            signal_data[
+                "bearish_score"
+            ],
 
-        # ----------------------------------------------------
-        # Moving averages
-        # ----------------------------------------------------
+        "ma_5":
+            round_or_none(
+                row["ma_5"]
+            ),
 
-        "ma_5": round_or_none(
-            row["ma_5"]
-        ),
+        "ma_10":
+            round_or_none(
+                row["ma_10"]
+            ),
 
-        "ma_10": round_or_none(
-            row["ma_10"]
-        ),
+        "ma_20":
+            round_or_none(
+                row["ma_20"]
+            ),
 
-        "ma_20": round_or_none(
-            row["ma_20"]
-        ),
+        "ema_9":
+            round_or_none(
+                row["ema_9"]
+            ),
 
-        "ema_9": round_or_none(
-            row["ema_9"]
-        ),
+        "ema_20":
+            round_or_none(
+                row["ema_20"]
+            ),
 
-        "ema_20": round_or_none(
-            row["ema_20"]
-        ),
+        "ema_50":
+            round_or_none(
+                row["ema_50"]
+            ),
 
-        "ema_50": round_or_none(
-            row["ema_50"]
-        ),
+        "ema_100":
+            round_or_none(
+                row["ema_100"]
+            ),
 
-        "ema_100": round_or_none(
-            row["ema_100"]
-        ),
+        "ema_200":
+            round_or_none(
+                row["ema_200"]
+            ),
 
-        "ema_200": round_or_none(
-            row["ema_200"]
-        ),
+        "rsi_14":
+            round_or_none(
+                row["rsi_14"]
+            ),
 
-        # ----------------------------------------------------
-        # Indicators
-        # ----------------------------------------------------
+        "macd":
+            round_or_none(
+                row["macd"]
+            ),
 
-        "rsi_14": round_or_none(
-            row["rsi_14"]
-        ),
+        "macd_signal":
+            round_or_none(
+                row["macd_signal"]
+            ),
 
-        "macd": round_or_none(
-            row["macd"]
-        ),
+        "macd_histogram":
+            round_or_none(
+                row["macd_histogram"]
+            ),
 
-        "macd_signal": round_or_none(
-            row["macd_signal"]
-        ),
+        "momentum":
+            round_or_none(
+                row["momentum"]
+            ),
 
-        "macd_histogram": round_or_none(
-            row["macd_histogram"]
-        ),
+        "atr_14":
+            round_or_none(
+                row["atr_14"]
+            ),
 
-        "momentum": round_or_none(
-            row["momentum"]
-        ),
+        "adx_14":
+            round_or_none(
+                row["adx_14"]
+            ),
 
-        "atr_14": round_or_none(
-            row["atr_14"]
-        ),
-
-        "adx_14": round_or_none(
-            row["adx_14"]
-        ),
-
-        "vwap": round_or_none(
-            row["vwap"]
-        ),
-
-        # ----------------------------------------------------
-        # Bollinger
-        # ----------------------------------------------------
+        "vwap":
+            round_or_none(
+                row["vwap"]
+            ),
 
         "bollinger_upper":
             round_or_none(
@@ -1398,21 +2009,25 @@ def build_analysis(interval="5m"):
                 row["bollinger_lower"]
             ),
 
-        # ----------------------------------------------------
-        # Support resistance
-        # ----------------------------------------------------
-
         "support":
-            round_or_none(support),
+            round_or_none(
+                support
+            ),
 
         "support_2":
-            round_or_none(support2),
+            round_or_none(
+                support2
+            ),
 
         "resistance":
-            round_or_none(resistance),
+            round_or_none(
+                resistance
+            ),
 
         "resistance_2":
-            round_or_none(resistance2),
+            round_or_none(
+                resistance2
+            ),
 
         "support_distance_percent":
             round_or_none(
@@ -1432,15 +2047,15 @@ def build_analysis(interval="5m"):
         "near_resistance":
             near_resistance,
 
-        # ----------------------------------------------------
-        # Breakout
-        # ----------------------------------------------------
-
         "breakout_confirmed":
-            signal_data["breakout_confirmed"],
+            signal_data[
+                "breakout_confirmed"
+            ],
 
         "breakdown_confirmed":
-            signal_data["breakdown_confirmed"],
+            signal_data[
+                "breakdown_confirmed"
+            ],
 
         "false_breakout":
             false_breakout,
@@ -1448,71 +2063,87 @@ def build_analysis(interval="5m"):
         "false_breakdown":
             false_breakdown,
 
-        # ----------------------------------------------------
-        # Volume
-        # ----------------------------------------------------
-
         "volume_status":
             volume_status,
 
         "volume_ratio":
             volume_ratio,
 
-        # ----------------------------------------------------
-        # Trade plan
-        # ----------------------------------------------------
-
         "entry_zone":
-            trade_plan["entry_zone"],
+            trade_plan[
+                "entry_zone"
+            ],
 
         "avoid_zone":
-            trade_plan["avoid_zone"],
+            trade_plan[
+                "avoid_zone"
+            ],
 
         "trade_status":
-            trade_plan["trade_status"],
+            trade_plan[
+                "trade_status"
+            ],
 
         "entry":
-            trade_plan["entry"],
+            trade_plan[
+                "entry"
+            ],
 
         "stop_loss":
-            trade_plan["stop_loss"],
+            trade_plan[
+                "stop_loss"
+            ],
 
         "target_1":
-            trade_plan["target_1"],
+            trade_plan[
+                "target_1"
+            ],
 
         "target_2":
-            trade_plan["target_2"],
+            trade_plan[
+                "target_2"
+            ],
 
         "risk_points":
-            trade_plan["risk_points"],
+            trade_plan[
+                "risk_points"
+            ],
 
         "reward_1_points":
-            trade_plan["reward_1_points"],
+            trade_plan[
+                "reward_1_points"
+            ],
 
         "reward_2_points":
-            trade_plan["reward_2_points"],
+            trade_plan[
+                "reward_2_points"
+            ],
 
         "risk_reward_1":
-            trade_plan["risk_reward_1"],
+            trade_plan[
+                "risk_reward_1"
+            ],
 
         "risk_reward_2":
-            trade_plan["risk_reward_2"],
+            trade_plan[
+                "risk_reward_2"
+            ],
 
         "trailing_stop":
-            trade_plan["trailing_stop"],
-
-        # ----------------------------------------------------
-        # AI reasons
-        # ----------------------------------------------------
+            trade_plan[
+                "trailing_stop"
+            ],
 
         "reasons":
-            signal_data["reasons"],
+            signal_data[
+                "reasons"
+            ],
 
         "warnings":
             warnings,
 
         "analysis_version":
-            "V4.0",
+            "V4.1",
 
         "time":
             datetime.now(
@@ -1520,34 +2151,54 @@ def build_analysis(interval="5m"):
             ).isoformat()
     }
 
-    return response
-
 
 # ============================================================
-# ENDPOINTS
+# ROOT
 # ============================================================
 
 @app.get("/")
 def root():
 
     return {
-        "app": "Nifty AI Trader Backend",
-        "version": "4.0",
-        "status": "running",
-        "symbol": "NIFTY 50",
-        "data_source": "Yahoo Finance",
-        "live_detection": True,
+
+        "app":
+            "Nifty AI Trader Backend",
+
+        "version":
+            "4.1",
+
+        "status":
+            "running",
+
+        "symbol":
+            "NIFTY 50",
+
+        "data_source":
+            "Yahoo Finance",
+
+        "live_detection":
+            True,
+
+        "history_endpoint":
+            "/nifty/history?interval=5m",
+
         "message":
-            "Backend is running. "
-            "Use /nifty for analysis."
+            "Backend is running."
     }
 
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/health")
 def health():
 
     return {
-        "status": "ok",
+
+        "status":
+            "ok",
+
         "time":
             datetime.now(
                 timezone.utc
@@ -1555,46 +2206,18 @@ def health():
     }
 
 
+# ============================================================
+# NIFTY MAIN
+# ============================================================
+
 @app.get("/nifty")
 def nifty():
 
     try:
 
-        return build_analysis("5m")
-
-    except Exception as exc:
-
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc)
+        return build_analysis(
+            "5m"
         )
-
-
-@app.get("/nifty/{interval}")
-def nifty_interval(interval: str):
-
-    allowed = [
-        "1m",
-        "5m",
-        "15m",
-        "30m",
-        "1h",
-        "1D"
-    ]
-
-    if interval not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid interval. "
-                "Use 1m, 5m, 15m, "
-                "30m, 1h or 1D."
-            )
-        )
-
-    try:
-
-        return build_analysis(interval)
 
     except Exception as exc:
 
@@ -1606,6 +2229,12 @@ def nifty_interval(interval: str):
 
 # ============================================================
 # HISTORY ENDPOINT
+#
+# IMPORTANT:
+# THIS MUST COME BEFORE /nifty/{interval}
+#
+# Otherwise FastAPI can interpret "history"
+# as the interval parameter.
 # ============================================================
 
 @app.get("/nifty/history")
@@ -1613,49 +2242,140 @@ def nifty_history(
     interval: str = "5m"
 ):
 
-    allowed = [
-        "1m",
-        "5m",
-        "15m",
-        "30m",
-        "1h",
-        "1D"
-    ]
+    # --------------------------------------------------------
+    # Validate interval
+    # --------------------------------------------------------
 
-    if interval not in allowed:
+    if interval not in ALLOWED_INTERVALS:
+
         raise HTTPException(
             status_code=400,
-            detail="Invalid interval."
+            detail=(
+                "Invalid interval. "
+                "Use 1m, 5m, 15m, "
+                "30m, 1h or 1D."
+            )
         )
 
     try:
 
-        df = fetch_history(interval)
+        # ----------------------------------------------------
+        # Fetch candles
+        # ----------------------------------------------------
+
+        df = fetch_history(
+            interval
+        )
+
+        # ----------------------------------------------------
+        # Keep latest 300 candles
+        # ----------------------------------------------------
+
+        df = df.tail(
+            300
+        )
 
         candles = []
 
-        for index, row in df.tail(300).iterrows():
+        # ----------------------------------------------------
+        # Convert candles to JSON-safe format
+        # ----------------------------------------------------
+
+        for index, row in df.iterrows():
 
             try:
 
                 timestamp = index
 
-                if timestamp.tzinfo is None:
-                    timestamp = timestamp.tz_localize(
-                        "UTC"
+                if isinstance(
+                    timestamp,
+                    pd.Timestamp
+                ):
+
+                    if timestamp.tzinfo is None:
+
+                        timestamp = (
+                            timestamp.tz_localize(
+                                "UTC"
+                            )
+                        )
+
+                    timestamp = (
+                        timestamp.tz_convert(
+                            IST
+                        )
                     )
 
-                timestamp = timestamp.tz_convert(
-                    IST
-                )
+                    timestamp_string = (
+                        timestamp.isoformat()
+                    )
 
-                timestamp_string = (
-                    timestamp.isoformat()
-                )
+                elif isinstance(
+                    timestamp,
+                    datetime
+                ):
+
+                    if timestamp.tzinfo is None:
+
+                        timestamp = (
+                            timestamp.replace(
+                                tzinfo=timezone.utc
+                            )
+                        )
+
+                    timestamp_string = (
+                        timestamp.astimezone(
+                            IST
+                        ).isoformat()
+                    )
+
+                else:
+
+                    timestamp_string = str(
+                        timestamp
+                    )
 
             except Exception:
 
-                timestamp_string = str(index)
+                timestamp_string = str(
+                    index
+                )
+
+            open_price = safe_float(
+                row["open"]
+            )
+
+            high_price = safe_float(
+                row["high"]
+            )
+
+            low_price = safe_float(
+                row["low"]
+            )
+
+            close_price = safe_float(
+                row["close"]
+            )
+
+            volume_value = safe_float(
+                row["volume"]
+            )
+
+            # ------------------------------------------------
+            # Only return valid OHLC candles
+            # ------------------------------------------------
+
+            if (
+                open_price is None
+                or
+                high_price is None
+                or
+                low_price is None
+                or
+                close_price is None
+            ):
+
+                continue
 
             candles.append({
 
@@ -1663,51 +2383,70 @@ def nifty_history(
                     timestamp_string,
 
                 "open":
-                    round_or_none(
-                        row["open"]
+                    round(
+                        open_price,
+                        2
                     ),
 
                 "high":
-                    round_or_none(
-                        row["high"]
+                    round(
+                        high_price,
+                        2
                     ),
 
                 "low":
-                    round_or_none(
-                        row["low"]
+                    round(
+                        low_price,
+                        2
                     ),
 
                 "close":
-                    round_or_none(
-                        row["close"]
+                    round(
+                        close_price,
+                        2
                     ),
 
                 "volume":
-                    round_or_none(
-                        row["volume"]
+                    round(
+                        volume_value,
+                        2
                     )
+                    if volume_value is not None
+                    else None
             })
 
-        age = get_data_age_seconds(df)
+        # ----------------------------------------------------
+        # Market status
+        # ----------------------------------------------------
 
-        status = calculate_market_status(
-            df
+        status = (
+            calculate_market_status(
+                df
+            )
         )
 
         return {
 
-            "symbol": "NIFTY 50",
+            "symbol":
+                "NIFTY 50",
 
-            "interval": interval,
+            "interval":
+                interval,
 
             "market_status":
-                status["market_status"],
+                status[
+                    "market_status"
+                ],
 
             "data_age_seconds":
-                status["data_age_seconds"],
+                status[
+                    "data_age_seconds"
+                ],
 
             "latest_data_time":
-                status["latest_data_time"],
+                status[
+                    "latest_data_time"
+                ],
 
             "count":
                 len(candles),
@@ -1720,6 +2459,43 @@ def nifty_history(
                     timezone.utc
                 ).isoformat()
         }
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc)
+        )
+
+
+# ============================================================
+# INTERVAL ANALYSIS
+#
+# IMPORTANT:
+# THIS COMES AFTER /nifty/history
+# ============================================================
+
+@app.get("/nifty/{interval}")
+def nifty_interval(
+    interval: str
+):
+
+    if interval not in ALLOWED_INTERVALS:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid interval. "
+                "Use 1m, 5m, 15m, "
+                "30m, 1h or 1D."
+            )
+        )
+
+    try:
+
+        return build_analysis(
+            interval
+        )
 
     except Exception as exc:
 
