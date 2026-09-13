@@ -1,10 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 
-app = FastAPI(title="NIFTY AI Backend V3.0")
+app = FastAPI(title="NIFTY AI Backend V3.1")
 
 
 # =========================================================
@@ -14,7 +14,7 @@ app = FastAPI(title="NIFTY AI Backend V3.0")
 SYMBOL = "^NSEI"
 YAHOO_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI"
 
-ANALYSIS_VERSION = "V3.0"
+ANALYSIS_VERSION = "V3.1"
 
 NEAR_LEVEL_PERCENT = 0.20
 BREAK_CONFIRM_PERCENT = 0.10
@@ -54,7 +54,15 @@ def fetch_yahoo(range_value="1d", interval="5m"):
 
     response.raise_for_status()
 
-    result = response.json()["chart"]["result"][0]
+    data = response.json()
+
+    if "chart" not in data:
+        raise Exception("Yahoo response missing chart")
+
+    if not data["chart"].get("result"):
+        raise Exception("No Yahoo market data available")
+
+    result = data["chart"]["result"][0]
 
     timestamps = result.get("timestamp", [])
 
@@ -63,7 +71,8 @@ def fetch_yahoo(range_value="1d", interval="5m"):
     df = pd.DataFrame({
         "time": pd.to_datetime(
             timestamps,
-            unit="s"
+            unit="s",
+            utc=True
         ),
         "open": quote.get("open", []),
         "high": quote.get("high", []),
@@ -94,12 +103,14 @@ def safe_round(value, digits=2):
         return None
 
     try:
+
         if pd.isna(value):
             return None
 
         return round(float(value), digits)
 
     except Exception:
+
         return None
 
 
@@ -112,6 +123,7 @@ def calculate_rsi(series, period=14):
     delta = series.diff()
 
     gain = delta.clip(lower=0)
+
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.rolling(
@@ -196,6 +208,7 @@ def calculate_atr(df, period=14):
     value = atr.iloc[-1]
 
     if pd.isna(value):
+
         return float(
             (df["high"] - df["low"])
             .tail(period)
@@ -264,12 +277,15 @@ def calculate_volume(df):
     ratio = current / average
 
     if ratio >= 1.50:
+
         status = "HIGH"
 
     elif ratio <= 0.70:
+
         status = "LOW"
 
     else:
+
         status = "NORMAL"
 
     return status, ratio
@@ -321,6 +337,7 @@ def detect_breakout_breakdown(
     false_breakdown = False
 
     if len(df) < 3:
+
         return (
             breakout,
             breakdown,
@@ -334,9 +351,9 @@ def detect_breakout_breakdown(
 
     previous = df.iloc[-2]
 
-    # -----------------------------
+    # =====================================================
     # BREAKOUT
-    # -----------------------------
+    # =====================================================
 
     if price > resistance:
 
@@ -366,14 +383,16 @@ def detect_breakout_breakdown(
                 and momentum_confirmed
                 and macd_confirmed
             ):
+
                 breakout = True
 
             else:
+
                 false_breakout = True
 
-    # -----------------------------
+    # =====================================================
     # BREAKDOWN
-    # -----------------------------
+    # =====================================================
 
     if price < support:
 
@@ -403,9 +422,11 @@ def detect_breakout_breakdown(
                 and momentum_confirmed
                 and macd_confirmed
             ):
+
                 breakdown = True
 
             else:
+
                 false_breakdown = True
 
     return (
@@ -474,13 +495,14 @@ def build_trade_plan(
         "SELL",
         "STRONG SELL"
     ]:
+
         return plan
 
     if atr <= 0:
         return plan
 
     # =====================================================
-    # BUY PLAN
+    # BUY
     # =====================================================
 
     if signal in [
@@ -516,7 +538,6 @@ def build_trade_plan(
             risk * 2.50
         )
 
-        # Don't put target below resistance
         if resistance > entry:
 
             target_1 = max(
@@ -532,7 +553,7 @@ def build_trade_plan(
             target_2 - entry
         ) / risk
 
-        plan = {
+        return {
             "trade_status": "BUY SETUP",
             "entry": safe_round(entry),
             "stop_loss": safe_round(stop_loss),
@@ -558,10 +579,8 @@ def build_trade_plan(
             )
         }
 
-        return plan
-
     # =====================================================
-    # SELL PLAN
+    # SELL
     # =====================================================
 
     entry = price
@@ -607,7 +626,7 @@ def build_trade_plan(
         entry - target_2
     ) / risk
 
-    plan = {
+    return {
         "trade_status": "SELL SETUP",
         "entry": safe_round(entry),
         "stop_loss": safe_round(stop_loss),
@@ -633,8 +652,6 @@ def build_trade_plan(
         )
     }
 
-    return plan
-
 
 # =========================================================
 # HOME
@@ -645,7 +662,8 @@ def home():
 
     return {
         "status": "NIFTY AI backend running",
-        "version": ANALYSIS_VERSION
+        "version": ANALYSIS_VERSION,
+        "history_endpoint": "/nifty/history"
     }
 
 
@@ -660,6 +678,122 @@ def health():
         "status": "ok",
         "version": ANALYSIS_VERSION
     }
+
+
+# =========================================================
+# LIVE HISTORY / CANDLE ENDPOINT
+# =========================================================
+
+@app.get("/nifty/history")
+def nifty_history(
+    interval: str = Query(
+        "5m",
+        pattern="^(1m|2m|5m|15m|30m|60m|90m|1h|1d)$"
+    )
+):
+
+    try:
+
+        # Yahoo limitations:
+        # 1m data is generally available only
+        # for a short recent period.
+        if interval == "1m":
+
+            range_value = "1d"
+
+        elif interval in [
+            "2m",
+            "5m",
+            "15m",
+            "30m"
+        ]:
+
+            range_value = "5d"
+
+        elif interval in [
+            "60m",
+            "90m",
+            "1h"
+        ]:
+
+            range_value = "1mo"
+
+        else:
+
+            range_value = "1y"
+
+        df, meta = fetch_yahoo(
+            range_value,
+            interval
+        )
+
+        if df.empty:
+
+            return {
+                "error": "No historical data available",
+                "symbol": "NIFTY 50",
+                "interval": interval,
+                "candles": []
+            }
+
+        # Keep response reasonably small
+        # for Android mobile.
+        max_candles = 300
+
+        df = df.tail(
+            max_candles
+        ).copy()
+
+        candles = []
+
+        for _, row in df.iterrows():
+
+            candles.append({
+                "time": row["time"].isoformat(),
+                "open": safe_round(
+                    row["open"]
+                ),
+                "high": safe_round(
+                    row["high"]
+                ),
+                "low": safe_round(
+                    row["low"]
+                ),
+                "close": safe_round(
+                    row["close"]
+                ),
+                "volume": safe_round(
+                    row["volume"],
+                    0
+                )
+            })
+
+        return {
+            "symbol": "NIFTY 50",
+            "interval": interval,
+            "candles": candles,
+            "count": len(candles),
+            "market_status": market_status(meta),
+            "latest_price": safe_round(
+                float(df["close"].iloc[-1])
+            ),
+            "time": datetime.now(
+                timezone.utc
+            ).isoformat(),
+            "analysis_version":
+                ANALYSIS_VERSION
+        }
+
+    except Exception as e:
+
+        return {
+            "error": str(e),
+            "symbol": "NIFTY 50",
+            "interval": interval,
+            "candles": [],
+            "analysis_version":
+                ANALYSIS_VERSION
+        }
 
 
 # =========================================================
@@ -800,7 +934,11 @@ def nifty_analysis():
             calculate_levels(df)
         )
 
-        if support is None or resistance is None:
+        if (
+            support is None
+            or
+            resistance is None
+        ):
 
             return {
                 "error":
@@ -894,9 +1032,9 @@ def nifty_analysis():
 
         reasons = []
 
-        # -------------------------------------------------
+        # =================================================
         # SHORT TERM MA
-        # -------------------------------------------------
+        # =================================================
 
         if price > ma5 > ma10:
 
@@ -914,9 +1052,9 @@ def nifty_analysis():
                 "Bearish short-term trend"
             )
 
-        # -------------------------------------------------
+        # =================================================
         # MA20
-        # -------------------------------------------------
+        # =================================================
 
         if price > ma20:
 
@@ -926,9 +1064,9 @@ def nifty_analysis():
 
             bearish_score += 1
 
-        # -------------------------------------------------
+        # =================================================
         # HIGHER TIMEFRAME
-        # -------------------------------------------------
+        # =================================================
 
         if higher_tf_trend == "BULLISH":
 
@@ -946,9 +1084,9 @@ def nifty_analysis():
                 "Higher timeframe bearish"
             )
 
-        # -------------------------------------------------
+        # =================================================
         # RSI
-        # -------------------------------------------------
+        # =================================================
 
         if rsi14 >= 55:
 
@@ -966,9 +1104,9 @@ def nifty_analysis():
                 "RSI bearish"
             )
 
-        # -------------------------------------------------
+        # =================================================
         # MACD
-        # -------------------------------------------------
+        # =================================================
 
         if macd > macd_signal:
 
@@ -986,9 +1124,9 @@ def nifty_analysis():
                 "MACD bearish"
             )
 
-        # -------------------------------------------------
+        # =================================================
         # MOMENTUM
-        # -------------------------------------------------
+        # =================================================
 
         if momentum > 0:
 
@@ -1006,9 +1144,9 @@ def nifty_analysis():
                 "Negative momentum"
             )
 
-        # -------------------------------------------------
+        # =================================================
         # BREAKOUT
-        # -------------------------------------------------
+        # =================================================
 
         if breakout_confirmed:
 
@@ -1018,9 +1156,9 @@ def nifty_analysis():
                 "Confirmed resistance breakout"
             )
 
-        # -------------------------------------------------
+        # =================================================
         # BREAKDOWN
-        # -------------------------------------------------
+        # =================================================
 
         if breakdown_confirmed:
 
@@ -1038,16 +1176,18 @@ def nifty_analysis():
 
         if (
             higher_tf_trend == "BULLISH"
-            and bearish_score >
-                bullish_score
+            and
+            bearish_score >
+            bullish_score
         ):
 
             higher_tf_conflict = True
 
         elif (
             higher_tf_trend == "BEARISH"
-            and bullish_score >
-                bearish_score
+            and
+            bullish_score >
+            bearish_score
         ):
 
             higher_tf_conflict = True
@@ -1059,19 +1199,16 @@ def nifty_analysis():
         signal = "NEUTRAL"
         signal_strength = "LOW"
 
-        # Confirmed breakdown first
         if breakdown_confirmed:
 
             signal = "STRONG SELL"
             signal_strength = "HIGH"
 
-        # Confirmed breakout
         elif breakout_confirmed:
 
             signal = "STRONG BUY"
             signal_strength = "HIGH"
 
-        # False breakdown
         elif false_breakdown:
 
             signal = "WAIT"
@@ -1081,7 +1218,6 @@ def nifty_analysis():
                 "Possible false breakdown"
             )
 
-        # False breakout
         elif false_breakout:
 
             signal = "WAIT"
@@ -1091,7 +1227,6 @@ def nifty_analysis():
                 "Possible false breakout"
             )
 
-        # Higher timeframe conflict
         elif higher_tf_conflict:
 
             signal = "WAIT"
@@ -1101,7 +1236,6 @@ def nifty_analysis():
                 "Higher timeframe conflict"
             )
 
-        # Near support
         elif near_support:
 
             signal = "WAIT"
@@ -1111,7 +1245,6 @@ def nifty_analysis():
                 "Price near support"
             )
 
-        # Near resistance
         elif near_resistance:
 
             signal = "WAIT"
@@ -1121,25 +1254,23 @@ def nifty_analysis():
                 "Price near resistance"
             )
 
-        # Normal BUY
         elif (
             bullish_score >= MIN_SCORE
             and
             bullish_score >
-                bearish_score +
-                MIN_SCORE_GAP
+            bearish_score +
+            MIN_SCORE_GAP
         ):
 
             signal = "BUY"
             signal_strength = "MODERATE"
 
-        # Normal SELL
         elif (
             bearish_score >= MIN_SCORE
             and
             bearish_score >
-                bullish_score +
-                MIN_SCORE_GAP
+            bullish_score +
+            MIN_SCORE_GAP
         ):
 
             signal = "SELL"
@@ -1244,14 +1375,14 @@ def nifty_analysis():
             "STRONG SELL"
         ]:
 
+            rr_value = trade_plan[
+                "risk_reward_1"
+            ]
+
             if (
-                trade_plan[
-                    "risk_reward_1"
-                ] is not None
+                rr_value is not None
                 and
-                trade_plan[
-                    "risk_reward_1"
-                ] < MIN_RR
+                rr_value < MIN_RR
             ):
 
                 warnings.append(
@@ -1297,9 +1428,7 @@ def nifty_analysis():
             ]
 
             avoid_zone = [
-                safe_round(
-                    support
-                ),
+                safe_round(support),
                 safe_round(
                     support - atr
                 )
@@ -1321,9 +1450,7 @@ def nifty_analysis():
             ]
 
             avoid_zone = [
-                safe_round(
-                    resistance
-                ),
+                safe_round(resistance),
                 safe_round(
                     resistance + atr
                 )
@@ -1378,9 +1505,7 @@ def nifty_analysis():
                 signal_strength,
 
             "confidence":
-                safe_round(
-                    confidence
-                ),
+                safe_round(confidence),
 
             "bullish_score":
                 bullish_score,
@@ -1404,34 +1529,22 @@ def nifty_analysis():
                 safe_round(macd),
 
             "macd_signal":
-                safe_round(
-                    macd_signal
-                ),
+                safe_round(macd_signal),
 
             "macd_histogram":
-                safe_round(
-                    macd_hist
-                ),
+                safe_round(macd_hist),
 
             "momentum":
-                safe_round(
-                    momentum
-                ),
+                safe_round(momentum),
 
             "atr_14":
-                safe_round(
-                    atr
-                ),
+                safe_round(atr),
 
             "support":
-                safe_round(
-                    support
-                ),
+                safe_round(support),
 
             "resistance":
-                safe_round(
-                    resistance
-                ),
+                safe_round(resistance),
 
             "support_distance_percent":
                 safe_round(
@@ -1478,39 +1591,25 @@ def nifty_analysis():
             "avoid_zone":
                 avoid_zone,
 
-            # =============================================
-            # V3 TRADE PLAN
-            # =============================================
-
             "trade_status":
                 trade_plan[
                     "trade_status"
                 ],
 
             "entry":
-                trade_plan[
-                    "entry"
-                ],
+                trade_plan["entry"],
 
             "stop_loss":
-                trade_plan[
-                    "stop_loss"
-                ],
+                trade_plan["stop_loss"],
 
             "target_1":
-                trade_plan[
-                    "target_1"
-                ],
+                trade_plan["target_1"],
 
             "target_2":
-                trade_plan[
-                    "target_2"
-                ],
+                trade_plan["target_2"],
 
             "risk_points":
-                trade_plan[
-                    "risk_points"
-                ],
+                trade_plan["risk_points"],
 
             "reward_1_points":
                 trade_plan[
@@ -1556,8 +1655,7 @@ def nifty_analysis():
 
         return {
 
-            "error":
-                str(e),
+            "error": str(e),
 
             "analysis_version":
                 ANALYSIS_VERSION
