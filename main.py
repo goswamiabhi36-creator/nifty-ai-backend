@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 import threading
 import time
+import requests
+
 from kotak_oi import (
     get_oi_analysis,
     kotak_status,
