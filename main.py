@@ -10,6 +10,11 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 import threading
 import time
+from kotak_oi import (
+    get_oi_analysis,
+    kotak_status,
+    get_nearest_expiry
+)
 
 
 # ============================================================
@@ -3946,15 +3951,84 @@ def version():
 
 
 # ============================================================
-# MAIN NIFTY ENDPOINT
+# MAIN NIFTY ENDPOINT + OI
 # ============================================================
 
 @app.get("/nifty")
 def nifty():
 
-    return build_analysis(
-        "5m"
-    )
+    result = build_analysis("5m")
+
+    try:
+
+        oi = get_oi_analysis(
+            count=40
+        )
+
+        result["oi"] = oi
+
+        result["oi_status"] = oi.get(
+            "status",
+            "ERROR"
+        )
+
+        result["oi_source"] = oi.get(
+            "source",
+            "Kotak Neo"
+        )
+
+        result["oi_bias"] = oi.get(
+            "oi_bias",
+            "UNKNOWN"
+        )
+
+        result["oi_score"] = oi.get(
+            "oi_score",
+            0
+        )
+
+        result["pcr"] = oi.get(
+            "pcr"
+        )
+
+        result["change_oi_pcr"] = oi.get(
+            "change_oi_pcr"
+        )
+
+        result["max_pain"] = oi.get(
+            "max_pain"
+        )
+
+        result["oi_support"] = oi.get(
+            "oi_support"
+        )
+
+        result["oi_resistance"] = oi.get(
+            "oi_resistance"
+        )
+
+    except Exception as exc:
+
+        result["oi"] = {
+            "status": "ERROR",
+            "source": "Kotak Neo",
+            "message": str(exc)
+        }
+
+        result["oi_status"] = "ERROR"
+        result["oi_source"] = "Kotak Neo"
+
+        result["oi_bias"] = "UNKNOWN"
+        result["oi_score"] = 0
+
+        result["pcr"] = None
+        result["change_oi_pcr"] = None
+        result["max_pain"] = None
+
+        result["oi_support"] = None
+        result["oi_resistance"] = None
+
+    return result
 
 
 # ============================================================
@@ -4163,6 +4237,386 @@ def nifty_interval(
     return build_analysis(
         interval
     )
+# ============================================================
+# KOTAK OI ENDPOINTS
+# ============================================================
+
+@app.get("/kotak/status")
+def kotak_api_status():
+
+    try:
+
+        return {
+            "status": "OK",
+            **kotak_status(),
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        return {
+            "status": "ERROR",
+            "provider": "Kotak Neo",
+            "configured": False,
+            "market_data": False,
+            "option_chain": False,
+            "order_placement": False,
+            "error": str(exc),
+            "timestamp": now_ist().isoformat()
+        }
+
+
+# ============================================================
+# KOTAK EXPIRY
+# ============================================================
+
+@app.get("/kotak/expiry")
+def kotak_expiry():
+
+    try:
+
+        expiries = []
+
+        try:
+
+            from kotak_oi import get_nifty_expiries
+
+            expiries = get_nifty_expiries()
+
+        except Exception:
+
+            nearest = get_nearest_expiry()
+
+            if nearest:
+                expiries = [nearest]
+
+        return {
+
+            "status": "OK",
+
+            "provider": "Kotak Neo",
+
+            "symbol": "NIFTY",
+
+            "nearest_expiry": (
+                expiries[0]
+                if expiries
+                else None
+            ),
+
+            "expiries": expiries,
+
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=503,
+            detail=f"Kotak expiry error: {str(exc)}"
+        )
+
+
+# ============================================================
+# COMPLETE OI
+# ============================================================
+
+@app.get("/oi")
+def option_chain_oi(
+    expiry: Optional[str] = None,
+    count: int = 40
+):
+
+    try:
+
+        data = get_oi_analysis(
+            expiry=expiry,
+            count=count
+        )
+
+        return {
+
+            "app": "NIFTY AI TRADER",
+
+            "version": "FINAL-OI-1.0",
+
+            "status": "OK",
+
+            "data_source": "Kotak Neo",
+
+            **data,
+
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        return {
+
+            "app": "NIFTY AI TRADER",
+
+            "version": "FINAL-OI-1.0",
+
+            "status": "UNAVAILABLE",
+
+            "data_source": "Kotak Neo",
+
+            "error": str(exc),
+
+            "message": (
+                "Option Chain/OI data is currently unavailable."
+            ),
+
+            "timestamp": now_ist().isoformat()
+        }
+
+
+# ============================================================
+# OI SUMMARY
+# ============================================================
+
+@app.get("/oi/summary")
+def option_chain_oi_summary(
+    expiry: Optional[str] = None,
+    count: int = 40
+):
+
+    try:
+
+        data = get_oi_analysis(
+            expiry=expiry,
+            count=count
+        )
+
+        return {
+
+            "status": "OK",
+
+            "source": "Kotak Neo",
+
+            "symbol": "NIFTY",
+
+            "expiry": data.get(
+                "expiry"
+            ),
+
+            "total_call_oi": data.get(
+                "total_call_oi"
+            ),
+
+            "total_put_oi": data.get(
+                "total_put_oi"
+            ),
+
+            "call_change_oi": data.get(
+                "call_change_oi"
+            ),
+
+            "put_change_oi": data.get(
+                "put_change_oi"
+            ),
+
+            "pcr": data.get(
+                "pcr"
+            ),
+
+            "change_oi_pcr": data.get(
+                "change_oi_pcr"
+            ),
+
+            "max_pain": data.get(
+                "max_pain"
+            ),
+
+            "oi_support": data.get(
+                "oi_support"
+            ),
+
+            "oi_resistance": data.get(
+                "oi_resistance"
+            ),
+
+            "oi_bias": data.get(
+                "oi_bias"
+            ),
+
+            "oi_score": data.get(
+                "oi_score"
+            ),
+
+            "oi_reasons": data.get(
+                "oi_reasons"
+            ),
+
+            "top_call_oi": data.get(
+                "top_call_oi"
+            ),
+
+            "top_put_oi": data.get(
+                "top_put_oi"
+            ),
+
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        return {
+
+            "status": "UNAVAILABLE",
+
+            "source": "Kotak Neo",
+
+            "symbol": "NIFTY",
+
+            "error": str(exc),
+
+            "timestamp": now_ist().isoformat()
+        }
+
+
+# ============================================================
+# OI LEVELS
+# ============================================================
+
+@app.get("/oi/levels")
+def option_chain_oi_levels(
+    expiry: Optional[str] = None,
+    count: int = 40
+):
+
+    try:
+
+        data = get_oi_analysis(
+            expiry=expiry,
+            count=count
+        )
+
+        return {
+
+            "status": "OK",
+
+            "source": "Kotak Neo",
+
+            "symbol": "NIFTY",
+
+            "expiry": data.get(
+                "expiry"
+            ),
+
+            "oi_support": data.get(
+                "oi_support"
+            ),
+
+            "oi_resistance": data.get(
+                "oi_resistance"
+            ),
+
+            "max_pain": data.get(
+                "max_pain"
+            ),
+
+            "pcr": data.get(
+                "pcr"
+            ),
+
+            "change_oi_pcr": data.get(
+                "change_oi_pcr"
+            ),
+
+            "top_call_oi": data.get(
+                "top_call_oi"
+            ),
+
+            "top_put_oi": data.get(
+                "top_put_oi"
+            ),
+
+            "oi_bias": data.get(
+                "oi_bias"
+            ),
+
+            "oi_score": data.get(
+                "oi_score"
+            ),
+
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        return {
+
+            "status": "UNAVAILABLE",
+
+            "source": "Kotak Neo",
+
+            "error": str(exc),
+
+            "timestamp": now_ist().isoformat()
+        }
+
+
+# ============================================================
+# STRIKE-WISE OI CHAIN
+# ============================================================
+
+@app.get("/oi/chain")
+def option_chain_oi_chain(
+    expiry: Optional[str] = None,
+    count: int = 40
+):
+
+    try:
+
+        data = get_oi_analysis(
+            expiry=expiry,
+            count=count
+        )
+
+        return {
+
+            "status": "OK",
+
+            "source": "Kotak Neo",
+
+            "symbol": "NIFTY",
+
+            "expiry": data.get(
+                "expiry"
+            ),
+
+            "count": len(
+                data.get(
+                    "chain",
+                    []
+                )
+            ),
+
+            "chain": data.get(
+                "chain",
+                []
+            ),
+
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        return {
+
+            "status": "UNAVAILABLE",
+
+            "source": "Kotak Neo",
+
+            "symbol": "NIFTY",
+
+            "chain": [],
+
+            "error": str(exc),
+
+            "timestamp": now_ist().isoformat()
+        }    
 
 
 # ============================================================
