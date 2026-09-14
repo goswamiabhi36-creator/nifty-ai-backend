@@ -4325,6 +4325,82 @@ def dhan_api_status():
             "message": str(exc),
             "timestamp": now_ist().isoformat()
         }
+# ============================================================
+# DHAN NIFTY OPTION CHAIN
+# READ-ONLY — NO ORDER PLACEMENT
+# ============================================================
+
+@app.post("/dhan/optionchain")
+def dhan_option_chain(expiry: str):
+
+    token = os.getenv("DHAN_ACCESS_TOKEN")
+
+    if not token:
+        return {
+            "status": "ERROR",
+            "provider": "Dhan",
+            "message": "DHAN_ACCESS_TOKEN is not configured.",
+            "timestamp": now_ist().isoformat()
+        }
+
+    try:
+
+        response = requests.post(
+            "https://api.dhan.co/v2/optionchain",
+            headers={
+                "access-token": token,
+                "client-id": os.getenv("DHAN_CLIENT_ID", "1109357555"),
+                "Content-Type": "application/json"
+            },
+            json={
+                "UnderlyingScrip": 13,
+                "UnderlyingSeg": "IDX_I",
+                "Expiry": expiry
+            },
+            timeout=20
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+
+        if response.status_code != 200:
+
+            return {
+                "status": "ERROR",
+                "provider": "Dhan",
+                "http_status": response.status_code,
+                "message": data.get(
+                    "errorMessage",
+                    data.get(
+                        "message",
+                        "Dhan Option Chain request failed."
+                    )
+                ),
+                "response": data,
+                "timestamp": now_ist().isoformat()
+            }
+
+        return {
+            "status": "OK",
+            "provider": "Dhan",
+            "underlying": "NIFTY",
+            "underlying_scrip": 13,
+            "underlying_segment": "IDX_I",
+            "expiry": expiry,
+            "data": data,
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        return {
+            "status": "ERROR",
+            "provider": "Dhan",
+            "message": str(exc),
+            "timestamp": now_ist().isoformat()
+        }
 
 
 # ============================================================
