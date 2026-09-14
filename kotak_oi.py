@@ -1,6 +1,6 @@
 # ============================================================
 # NIFTY AI TRADER — KOTAK NEO OI ENGINE
-# Version: OI-1.0
+# Version: OI-1.1
 #
 # Market Data Only
 # NO ORDER PLACEMENT
@@ -10,6 +10,7 @@ import os
 import math
 import threading
 import time
+
 from datetime import datetime
 from typing import Optional
 
@@ -206,6 +207,47 @@ def set_cached_oi(key, value):
 
 
 # ============================================================
+# CHECK OPTION CHAIN DATA
+# ============================================================
+
+def has_option_chain_data(response):
+
+    if not isinstance(response, dict):
+
+        return False
+
+    data = response.get(
+        "data",
+        {}
+    )
+
+    if not isinstance(data, dict):
+
+        return False
+
+    calls = data.get(
+        "call",
+        []
+    )
+
+    puts = data.get(
+        "put",
+        []
+    )
+
+    if not isinstance(calls, list):
+        calls = []
+
+    if not isinstance(puts, list):
+        puts = []
+
+    return (
+        len(calls) > 0 or
+        len(puts) > 0
+    )
+
+
+# ============================================================
 # RAW OPTION CHAIN
 # ============================================================
 
@@ -213,6 +255,8 @@ def fetch_option_chain(
     expiry: Optional[str] = None,
     count: int = DEFAULT_COUNT
 ):
+
+    requested_expiry = expiry
 
     if expiry is None:
 
@@ -226,13 +270,11 @@ def fetch_option_chain(
 
         count = DEFAULT_COUNT
 
-    # Kotak requires a sensible strike count.
     count = max(
         10,
         min(count, 100)
     )
 
-    # Keep count as a multiple of 10.
     count = (
         count // 10
     ) * 10
@@ -246,9 +288,14 @@ def fetch_option_chain(
     )
 
     if cached is not None:
+
         return cached
 
     client = get_kotak_client()
+
+    # --------------------------------------------------------
+    # ATTEMPT 1
+    # --------------------------------------------------------
 
     response = client.option_chain(
         exchange=KOTAK_EXCHANGE,
@@ -264,9 +311,95 @@ def fetch_option_chain(
             "Invalid Kotak option-chain response."
         )
 
-    set_cached_oi(
-        cache_key,
-        response
+    # --------------------------------------------------------
+    # IF DATA EXISTS, RETURN IT
+    # --------------------------------------------------------
+
+    if has_option_chain_data(response):
+
+        response["_requested_expiry"] = (
+            requested_expiry
+        )
+
+        response["_actual_expiry"] = (
+            expiry
+        )
+
+        response["_chain_attempt"] = (
+            "explicit_expiry"
+        )
+
+        set_cached_oi(
+            cache_key,
+            response
+        )
+
+        return response
+
+    # --------------------------------------------------------
+    # ATTEMPT 2
+    #
+    # Ask Kotak for nearest expiry automatically.
+    # This protects against an expiry-specific empty response.
+    # --------------------------------------------------------
+
+    try:
+
+        fallback_response = client.option_chain(
+            exchange=KOTAK_EXCHANGE,
+            underlying=KOTAK_UNDERLYING,
+            expiry=None,
+            instrument_type="option",
+            count=count
+        )
+
+        if (
+            isinstance(
+                fallback_response,
+                dict
+            )
+            and
+            has_option_chain_data(
+                fallback_response
+            )
+        ):
+
+            fallback_response[
+                "_requested_expiry"
+            ] = requested_expiry
+
+            fallback_response[
+                "_actual_expiry"
+            ] = expiry
+
+            fallback_response[
+                "_chain_attempt"
+            ] = "nearest_expiry_fallback"
+
+            set_cached_oi(
+                cache_key,
+                fallback_response
+            )
+
+            return fallback_response
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # NO DATA
+    # --------------------------------------------------------
+
+    response["_requested_expiry"] = (
+        requested_expiry
+    )
+
+    response["_actual_expiry"] = (
+        expiry
+    )
+
+    response["_chain_attempt"] = (
+        "no_data"
     )
 
     return response
@@ -282,6 +415,7 @@ def normalize_option(
 ):
 
     if not isinstance(item, dict):
+
         return None
 
     instrument = item.get(
@@ -583,8 +717,10 @@ def top_oi_rows(
 ):
 
     valid = [
+
         row
         for row in rows
+
         if row.get("oi") is not None
     ]
 
@@ -611,6 +747,9 @@ def total_oi(rows):
         if row.get("oi") is not None
     ]
 
+    if not values:
+        return 0
+
     return safe_int(
         sum(values)
     )
@@ -626,6 +765,9 @@ def total_change_oi(rows):
 
         if row.get("change_oi") is not None
     ]
+
+    if not values:
+        return 0
 
     return safe_int(
         sum(values)
@@ -712,13 +854,14 @@ def calculate_max_pain(
                 ) * pe_oi
 
         if (
-            lowest_loss is None or
+            lowest_loss is None
+            or
             total_loss < lowest_loss
         ):
 
             lowest_loss = total_loss
 
-            best_strike = strike
+            best_strike = test_strike
 
     return safe_float(
         best_strike
@@ -750,14 +893,18 @@ def calculate_oi_levels(
 
     if top_calls:
 
-        oi_resistance = top_calls[0].get(
-            "strike"
+        oi_resistance = (
+            top_calls[0].get(
+                "strike"
+            )
         )
 
     if top_puts:
 
-        oi_support = top_puts[0].get(
-            "strike"
+        oi_support = (
+            top_puts[0].get(
+                "strike"
+            )
         )
 
     return {
@@ -822,16 +969,18 @@ def calculate_oi_bias(
             score -= 1
 
     # --------------------------------------------------------
-    # Change OI
+    # CHANGE OI
     # --------------------------------------------------------
 
     if (
-        call_change_oi is not None and
+        call_change_oi is not None
+        and
         put_change_oi is not None
     ):
 
         if (
-            put_change_oi > 0 and
+            put_change_oi > 0
+            and
             call_change_oi < 0
         ):
 
@@ -842,7 +991,8 @@ def calculate_oi_bias(
             )
 
         elif (
-            call_change_oi > 0 and
+            call_change_oi > 0
+            and
             put_change_oi < 0
         ):
 
@@ -853,7 +1003,8 @@ def calculate_oi_bias(
             )
 
         elif (
-            put_change_oi > 0 and
+            put_change_oi > 0
+            and
             call_change_oi > 0
         ):
 
@@ -862,7 +1013,7 @@ def calculate_oi_bias(
             )
 
     # --------------------------------------------------------
-    # Change PCR
+    # CHANGE PCR
     # --------------------------------------------------------
 
     if change_pcr is not None:
@@ -876,7 +1027,7 @@ def calculate_oi_bias(
             score -= 1
 
     # --------------------------------------------------------
-    # Final bias
+    # FINAL BIAS
     # --------------------------------------------------------
 
     if score >= 3:
@@ -910,6 +1061,8 @@ def get_oi_analysis(
     count: int = DEFAULT_COUNT
 ):
 
+    requested_expiry = expiry
+
     if expiry is None:
 
         expiry = get_nearest_expiry()
@@ -918,6 +1071,65 @@ def get_oi_analysis(
         expiry=expiry,
         count=count
     )
+
+    # --------------------------------------------------------
+    # VALIDATE RAW RESPONSE
+    # --------------------------------------------------------
+
+    if not isinstance(raw, dict):
+
+        return {
+
+            "status": "ERROR",
+
+            "source": "Kotak Neo",
+
+            "underlying": "NIFTY",
+
+            "exchange": KOTAK_EXCHANGE,
+
+            "expiry": expiry,
+
+            "message": (
+                "Invalid option-chain response."
+            ),
+
+            "total_call_oi": 0,
+
+            "total_put_oi": 0,
+
+            "call_change_oi": 0,
+
+            "put_change_oi": 0,
+
+            "pcr": None,
+
+            "change_oi_pcr": None,
+
+            "max_pain": None,
+
+            "oi_support": None,
+
+            "oi_resistance": None,
+
+            "oi_bias": "UNKNOWN",
+
+            "oi_score": 0,
+
+            "oi_reasons": [],
+
+            "top_call_oi": [],
+
+            "top_put_oi": [],
+
+            "chain": [],
+
+            "timestamp": datetime.now().isoformat()
+        }
+
+    # --------------------------------------------------------
+    # NORMALIZE
+    # --------------------------------------------------------
 
     normalized = normalize_chain(
         raw,
@@ -931,6 +1143,110 @@ def get_oi_analysis(
     puts = normalized[
         "puts"
     ]
+
+    # --------------------------------------------------------
+    # NO DATA CHECK
+    # --------------------------------------------------------
+
+    if (
+        len(calls) == 0
+        and
+        len(puts) == 0
+    ):
+
+        data = raw.get(
+            "data",
+            {}
+        )
+
+        if not isinstance(data, dict):
+            data = {}
+
+        return {
+
+            "status": "NO_DATA",
+
+            "source": "Kotak Neo",
+
+            "underlying": "NIFTY",
+
+            "exchange": KOTAK_EXCHANGE,
+
+            "expiry": expiry,
+
+            "requested_expiry": raw.get(
+                "_requested_expiry"
+            ),
+
+            "actual_expiry": raw.get(
+                "_actual_expiry",
+                expiry
+            ),
+
+            "chain_attempt": raw.get(
+                "_chain_attempt",
+                "no_data"
+            ),
+
+            "api_stat": raw.get(
+                "stat"
+            ),
+
+            "api_code": raw.get(
+                "stCode"
+            ),
+
+            "api_message": (
+                raw.get("errMsg")
+                or
+                raw.get("desc")
+            ),
+
+            "common_data": data.get(
+                "common_data",
+                {}
+            ),
+
+            "total_call_oi": 0,
+
+            "total_put_oi": 0,
+
+            "call_change_oi": 0,
+
+            "put_change_oi": 0,
+
+            "pcr": None,
+
+            "change_oi_pcr": None,
+
+            "max_pain": None,
+
+            "oi_support": None,
+
+            "oi_resistance": None,
+
+            "oi_bias": "UNKNOWN",
+
+            "oi_score": 0,
+
+            "oi_reasons": [
+
+                "Kotak Neo returned an empty option chain."
+
+            ],
+
+            "top_call_oi": [],
+
+            "top_put_oi": [],
+
+            "chain": [],
+
+            "timestamp": datetime.now().isoformat()
+        }
+
+    # --------------------------------------------------------
+    # BUILD ANALYSIS
+    # --------------------------------------------------------
 
     chain = build_strike_chain(
         normalized
@@ -978,6 +1294,10 @@ def get_oi_analysis(
         put_change_oi=put_change_oi
     )
 
+    # --------------------------------------------------------
+    # SUCCESS
+    # --------------------------------------------------------
+
     return {
 
         "status": "OK",
@@ -989,6 +1309,20 @@ def get_oi_analysis(
         "exchange": KOTAK_EXCHANGE,
 
         "expiry": expiry,
+
+        "requested_expiry": raw.get(
+            "_requested_expiry"
+        ),
+
+        "actual_expiry": raw.get(
+            "_actual_expiry",
+            expiry
+        ),
+
+        "chain_attempt": raw.get(
+            "_chain_attempt",
+            "explicit_expiry"
+        ),
 
         "lot_size": normalized[
             "lot_size"
