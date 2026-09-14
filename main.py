@@ -4330,7 +4330,7 @@ def dhan_api_status():
 # READ-ONLY — NO ORDER PLACEMENT
 # ============================================================
 
-@app.post("/dhan/optionchain")
+@app.get("/dhan/optionchain")
 def dhan_option_chain(expiry: str):
 
     token = os.getenv("DHAN_ACCESS_TOKEN")
