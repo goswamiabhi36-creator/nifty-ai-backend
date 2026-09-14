@@ -11,6 +11,7 @@ from typing import Optional
 import threading
 import time
 import requests
+import os
 
 from kotak_oi import (
     get_oi_analysis,
@@ -4243,8 +4244,96 @@ def nifty_interval(
 # KOTAK OI ENDPOINTS
 # ============================================================
 
+# ============================================================
+# DHAN API STATUS
+# ============================================================
+
+@app.get("/dhan/status")
+def dhan_api_status():
+    token = os.getenv("DHAN_ACCESS_TOKEN")
+
+    if not token:
+
+        return {
+            "status": "ERROR",
+            "provider": "Dhan",
+            "configured": False,
+            "message": "DHAN_ACCESS_TOKEN is not configured.",
+            "timestamp": now_ist().isoformat()
+        }
+
+    try:
+
+        response = requests.get(
+            "https://api.dhan.co/v2/profile",
+            headers={
+                "access-token": token
+            },
+            timeout=15
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+
+        if response.status_code != 200:
+
+            return {
+                "status": "ERROR",
+                "provider": "Dhan",
+                "configured": True,
+                "http_status": response.status_code,
+                "message": data.get(
+                    "errorMessage",
+                    data.get(
+                        "message",
+                        "Dhan API request failed."
+                    )
+                ),
+                "timestamp": now_ist().isoformat()
+            }
+
+        return {
+            "status": "OK",
+            "provider": "Dhan",
+            "configured": True,
+            "dhan_client_id": data.get(
+                "dhanClientId"
+            ),
+            "token_validity": data.get(
+                "tokenValidity"
+            ),
+            "active_segment": data.get(
+                "activeSegment"
+            ),
+            "data_plan": data.get(
+                "dataPlan"
+            ),
+            "data_validity": data.get(
+                "dataValidity"
+            ),
+            "timestamp": now_ist().isoformat()
+        }
+
+    except Exception as exc:
+
+        return {
+            "status": "ERROR",
+            "provider": "Dhan",
+            "configured": True,
+            "message": str(exc),
+            "timestamp": now_ist().isoformat()
+        }
+
+
+# ============================================================
+# KOTAK OI ENDPOINTS
+# ============================================================
+
 @app.get("/kotak/status")
 def kotak_api_status():
+
 
     try:
 
