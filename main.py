@@ -4402,6 +4402,17 @@ def dhan_option_chain(expiry: str):
             "timestamp": now_ist().isoformat()
         }
 
+# ============================================================
+# DHAN OPTION CHAIN BROWSER TEST
+# READ-ONLY
+# ============================================================
+
+@app.get("/dhan/optionchain/test")
+def dhan_optionchain_test():
+
+    return dhan_option_chain(
+        expiry="2026-09-15"
+    )
 
 # ============================================================
 # KOTAK OI ENDPOINTS
