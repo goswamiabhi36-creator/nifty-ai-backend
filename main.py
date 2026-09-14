@@ -4417,6 +4417,60 @@ def dhan_optionchain_test():
 # ============================================================
 # KOTAK OI ENDPOINTS
 # ============================================================
+# ============================================================
+# KOTAK RAW OPTION CHAIN DIAGNOSTIC
+# READ-ONLY — NO ORDER PLACEMENT
+# ============================================================
+
+@app.get("/kotak/oi/raw-test")
+def kotak_raw_option_chain_test():
+
+    try:
+
+        from neo_api_client import NeoAPI
+
+        consumer_key = os.getenv(
+            "NEO_CONSUMER_KEY"
+        )
+
+        if not consumer_key:
+
+            return {
+                "status": "ERROR",
+                "message": "NEO_CONSUMER_KEY is not configured."
+            }
+
+        client = NeoAPI(
+            consumer_key=consumer_key,
+            environment="prod"
+        )
+
+        response = client.option_chain(
+            exchange="nse_fo",
+            underlying="NIFTY",
+            expiry="2026-09-15",
+            instrument_type="option",
+            count=40
+        )
+
+        return {
+            "status": "RAW_RESPONSE",
+            "provider": "Kotak Neo",
+            "sdk_version": "3.0.6",
+            "response_type": str(type(response)),
+            "response": response
+        }
+
+    except Exception as exc:
+
+        return {
+            "status": "ERROR",
+            "provider": "Kotak Neo",
+            "sdk_version": "3.0.6",
+            "error_type": str(type(exc)),
+            "message": str(exc),
+            "timestamp": now_ist().isoformat()
+        }
 
 @app.get("/kotak/status")
 def kotak_api_status():
