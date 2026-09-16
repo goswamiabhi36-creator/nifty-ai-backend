@@ -54,6 +54,71 @@ SYMBOL = "^NSEI"
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# ============================================================
+# INDIA VIX
+# ============================================================
+
+VIX_SYMBOL = "^INDIAVIX"
+
+_vix_cache = {
+    "timestamp": 0,
+    "value": None
+}
+
+_vix_cache_lock = threading.Lock()
+
+VIX_CACHE_TTL = 15
+
+
+def get_india_vix():
+
+    now = time.time()
+
+    with _vix_cache_lock:
+
+        if (
+            _vix_cache["value"] is not None and
+            now - _vix_cache["timestamp"] < VIX_CACHE_TTL
+        ):
+            return _vix_cache["value"]
+
+    try:
+
+        vix_df = yf.download(
+            VIX_SYMBOL,
+            period="1d",
+            interval="1m",
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
+
+        vix_df = normalize_columns(vix_df)
+
+        if vix_df.empty:
+            return None
+
+        latest_vix = vix_df["Close"].dropna()
+
+        if latest_vix.empty:
+            return None
+
+        vix_value = safe_float(
+            latest_vix.iloc[-1],
+            2
+        )
+
+        with _vix_cache_lock:
+
+            _vix_cache["timestamp"] = now
+            _vix_cache["value"] = vix_value
+
+        return vix_value
+
+    except Exception:
+
+        return None
+
 MARKET_OPEN = dt_time(9, 15)
 MARKET_CLOSE = dt_time(15, 30)
 
@@ -2898,6 +2963,12 @@ def build_analysis(
         current["Close"]
     )
 
+        # ========================================================
+    # INDIA VIX
+    # ========================================================
+
+    india_vix = get_india_vix()
+
     # ========================================================
     # TIMESTAMP
     # ========================================================
@@ -3308,6 +3379,12 @@ def build_analysis(
         "day_high": day_stats["high"],
 
         "day_low": day_stats["low"],
+
+                # ----------------------------------------------------
+        # INDIA VIX
+        # ----------------------------------------------------
+
+        "india_vix": india_vix,
 
         # ----------------------------------------------------
         # MARKET STATUS
