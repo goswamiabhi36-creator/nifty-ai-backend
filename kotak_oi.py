@@ -1,11 +1,22 @@
 # ============================================================
-# NIFTY AI TRADER — KOTAK NEO OI ENGINE
-# Version: OI-2.0
+# NIFTY AI TRADER — KOTAK NEO OI INTELLIGENCE ENGINE
+# Version: OI-2.1
 #
 # Market Data Only
 # NO ORDER PLACEMENT
 #
 # Compatible with Kotak Neo Python SDK 3.0.6
+#
+# OI INTELLIGENCE:
+#   CALL BUYING
+#   CALL WRITING
+#   PUT BUYING
+#   PUT WRITING
+#   OI SHIFT
+#   OI SCORE
+#   OI CONFIDENCE
+#   OI BIAS
+#   OI SUPPORT / RESISTANCE
 # ============================================================
 
 import os
@@ -30,8 +41,40 @@ DEFAULT_COUNT = 40
 
 OI_CACHE_TTL = 15
 
+# Premium/OI intelligence thresholds
+PREMIUM_CHANGE_THRESHOLD = 0.0015
+OI_CHANGE_THRESHOLD = 0.02
+VOLUME_RATIO_THRESHOLD = 1.20
+
+# Score limits
+OI_SCORE_MIN = -10
+OI_SCORE_MAX = 10
+
+
+# ============================================================
+# CACHE
+# ============================================================
+
 _oi_cache = {}
 _oi_cache_lock = threading.Lock()
+
+# Previous option snapshot.
+#
+# Key:
+#   expiry:CE:strike
+#   expiry:PE:strike
+#
+# Value:
+#   {
+#       "ltp": ...,
+#       "oi": ...,
+#       "volume": ...,
+#       "timestamp": ...
+#   }
+#
+_oi_previous_snapshot = {}
+
+_oi_snapshot_lock = threading.Lock()
 
 
 # ============================================================
@@ -79,6 +122,21 @@ def get_env(name: str):
         return ""
 
     return value.strip()
+
+
+def clamp(
+    value,
+    minimum,
+    maximum
+):
+
+    return max(
+        minimum,
+        min(
+            maximum,
+            value
+        )
+    )
 
 
 # ============================================================
@@ -209,19 +267,7 @@ def set_cached_oi(key, value):
 
 
 # ============================================================
-# CHECK OPTION CHAIN DATA
-#
-# IMPORTANT:
-# Kotak Neo 3.0.6 uses:
-#
-# data/call
-# data/put
-#
-# and each option uses:
-#
-# inst
-# quote
-# oi
+# OPTION CHAIN CHECK
 # ============================================================
 
 def has_option_chain_data(response):
@@ -368,7 +414,9 @@ def fetch_option_chain(
 
             fallback_response[
                 "_chain_attempt"
-            ] = "nearest_expiry_fallback"
+            ] = (
+                "nearest_expiry_fallback"
+            )
 
             set_cached_oi(
                 cache_key,
@@ -389,27 +437,7 @@ def fetch_option_chain(
 
 
 # ============================================================
-# OPTION ROW NORMALIZER
-#
-# ACTUAL KOTAK 3.0.6 FORMAT:
-#
-# inst:
-#   neoSymbol
-#   symbol
-#   optType
-#   strkPrc
-#   exp
-#   moneyness
-#
-# quote:
-#   ltp
-#   vol
-#
-# oi:
-#   cur
-#   prev
-#   chg
-#   chgPct
+# OPTION NORMALIZER
 # ============================================================
 
 def normalize_option(
@@ -671,6 +699,321 @@ def normalize_chain(
 
 
 # ============================================================
+# PREVIOUS OPTION SNAPSHOT
+# ============================================================
+
+def get_previous_option_snapshot(
+    expiry,
+    option_type,
+    strike
+):
+
+    key = (
+        f"{expiry}:"
+        f"{option_type}:"
+        f"{strike}"
+    )
+
+    with _oi_snapshot_lock:
+
+        return _oi_previous_snapshot.get(
+            key
+        )
+
+
+def save_option_snapshot(
+    expiry,
+    option_type,
+    strike,
+    ltp,
+    oi,
+    volume
+):
+
+    key = (
+        f"{expiry}:"
+        f"{option_type}:"
+        f"{strike}"
+    )
+
+    with _oi_snapshot_lock:
+
+        _oi_previous_snapshot[key] = {
+
+            "ltp": ltp,
+
+            "oi": oi,
+
+            "volume": volume,
+
+            "timestamp": time.time()
+        }
+
+
+# ============================================================
+# OPTION PREMIUM CHANGE
+# ============================================================
+
+def calculate_premium_change(
+    current_ltp,
+    previous_ltp
+):
+
+    if (
+        current_ltp is None
+        or
+        previous_ltp is None
+        or
+        previous_ltp <= 0
+    ):
+
+        return None
+
+    return safe_float(
+        (
+            current_ltp -
+            previous_ltp
+        )
+        /
+        previous_ltp,
+        5
+    )
+
+
+# ============================================================
+# OI CHANGE %
+# ============================================================
+
+def calculate_oi_change_ratio(
+    current_oi,
+    previous_oi,
+    reported_change_pct=None
+):
+
+    if (
+        previous_oi is not None
+        and
+        previous_oi > 0
+        and
+        current_oi is not None
+    ):
+
+        return safe_float(
+            (
+                current_oi -
+                previous_oi
+            )
+            /
+            previous_oi,
+            5
+        )
+
+    if reported_change_pct is not None:
+
+        return safe_float(
+            reported_change_pct / 100.0,
+            5
+        )
+
+    return None
+
+
+# ============================================================
+# FOUR-WAY OPTION INTELLIGENCE
+#
+# IMPORTANT:
+# These are indications, NOT certainty.
+#
+# OI ↑ + Premium ↑ = BUYING indication
+# OI ↑ + Premium ↓ = WRITING indication
+# OI ↓ + Premium ↑ = SHORT COVERING indication
+# OI ↓ + Premium ↓ = LONG UNWINDING indication
+# ============================================================
+
+def classify_option_activity(
+    option_type,
+    current_ltp,
+    previous_ltp,
+    current_oi,
+    previous_oi,
+    change_oi,
+    change_oi_percent,
+    volume
+):
+
+    premium_change = calculate_premium_change(
+        current_ltp,
+        previous_ltp
+    )
+
+    oi_ratio = calculate_oi_change_ratio(
+        current_oi,
+        previous_oi,
+        change_oi_percent
+    )
+
+    # --------------------------------------------------------
+    # First snapshot
+    # --------------------------------------------------------
+
+    if (
+        premium_change is None
+        or
+        oi_ratio is None
+    ):
+
+        return {
+
+            "activity": "INSUFFICIENT_DATA",
+
+            "direction": "NEUTRAL",
+
+            "premium_change": premium_change,
+
+            "oi_change_ratio": oi_ratio,
+
+            "confidence": 0,
+
+            "reason":
+                "Waiting for previous premium/OI snapshot."
+        }
+
+    premium_up = (
+        premium_change >=
+        PREMIUM_CHANGE_THRESHOLD
+    )
+
+    premium_down = (
+        premium_change <=
+        -PREMIUM_CHANGE_THRESHOLD
+    )
+
+    oi_up = (
+        oi_ratio >=
+        OI_CHANGE_THRESHOLD
+    )
+
+    oi_down = (
+        oi_ratio <=
+        -OI_CHANGE_THRESHOLD
+    )
+
+    # --------------------------------------------------------
+    # CE
+    # --------------------------------------------------------
+
+    if option_type == "CE":
+
+        if oi_up and premium_up:
+
+            activity = "CALL_BUYING"
+            direction = "BULLISH"
+
+        elif oi_up and premium_down:
+
+            activity = "CALL_WRITING"
+            direction = "BEARISH"
+
+        elif oi_down and premium_up:
+
+            activity = "CALL_SHORT_COVERING"
+            direction = "BULLISH"
+
+        elif oi_down and premium_down:
+
+            activity = "CALL_LONG_UNWINDING"
+            direction = "BEARISH"
+
+        else:
+
+            activity = "CALL_NEUTRAL"
+            direction = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # PE
+    # --------------------------------------------------------
+
+    else:
+
+        if oi_up and premium_up:
+
+            activity = "PUT_BUYING"
+            direction = "BEARISH"
+
+        elif oi_up and premium_down:
+
+            activity = "PUT_WRITING"
+            direction = "BULLISH"
+
+        elif oi_down and premium_up:
+
+            activity = "PUT_SHORT_COVERING"
+            direction = "BEARISH"
+
+        elif oi_down and premium_down:
+
+            activity = "PUT_LONG_UNWINDING"
+            direction = "BULLISH"
+
+        else:
+
+            activity = "PUT_NEUTRAL"
+            direction = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # Confidence
+    # --------------------------------------------------------
+
+    oi_strength = min(
+        abs(oi_ratio) / 0.10,
+        1.0
+    )
+
+    premium_strength = min(
+        abs(premium_change) / 0.05,
+        1.0
+    )
+
+    confidence = int(
+        round(
+            (
+                oi_strength * 0.55 +
+                premium_strength * 0.45
+            ) * 100
+        )
+    )
+
+    if volume is not None and volume > 0:
+
+        confidence = min(
+            100,
+            confidence + 5
+        )
+
+    return {
+
+        "activity": activity,
+
+        "direction": direction,
+
+        "premium_change":
+            premium_change,
+
+        "oi_change_ratio":
+            oi_ratio,
+
+        "confidence":
+            confidence,
+
+        "reason":
+            f"{activity}: "
+            f"OI change {oi_ratio * 100:.2f}% "
+            f"and premium change "
+            f"{premium_change * 100:.2f}%."
+    }
+
+
+# ============================================================
 # BUILD STRIKE-WISE CHAIN
 # ============================================================
 
@@ -717,6 +1060,10 @@ def build_strike_chain(
 
     result = []
 
+    expiry = normalized.get(
+        "expiry"
+    )
+
     for strike in strikes:
 
         ce = call_map.get(
@@ -726,6 +1073,112 @@ def build_strike_chain(
         pe = put_map.get(
             strike
         )
+
+        # ----------------------------------------------------
+        # CE INTELLIGENCE
+        # ----------------------------------------------------
+
+        ce_intelligence = None
+
+        if ce:
+
+            previous = (
+                get_previous_option_snapshot(
+                    expiry,
+                    "CE",
+                    strike
+                )
+            )
+
+            ce_intelligence = classify_option_activity(
+
+                option_type="CE",
+
+                current_ltp=ce.get(
+                    "ltp"
+                ),
+
+                previous_ltp=(
+                    previous.get("ltp")
+                    if previous
+                    else None
+                ),
+
+                current_oi=ce.get(
+                    "oi"
+                ),
+
+                previous_oi=(
+                    previous.get("oi")
+                    if previous
+                    else None
+                ),
+
+                change_oi=ce.get(
+                    "change_oi"
+                ),
+
+                change_oi_percent=ce.get(
+                    "change_oi_percent"
+                ),
+
+                volume=ce.get(
+                    "volume"
+                )
+            )
+
+        # ----------------------------------------------------
+        # PE INTELLIGENCE
+        # ----------------------------------------------------
+
+        pe_intelligence = None
+
+        if pe:
+
+            previous = (
+                get_previous_option_snapshot(
+                    expiry,
+                    "PE",
+                    strike
+                )
+            )
+
+            pe_intelligence = classify_option_activity(
+
+                option_type="PE",
+
+                current_ltp=pe.get(
+                    "ltp"
+                ),
+
+                previous_ltp=(
+                    previous.get("ltp")
+                    if previous
+                    else None
+                ),
+
+                current_oi=pe.get(
+                    "oi"
+                ),
+
+                previous_oi=(
+                    previous.get("oi")
+                    if previous
+                    else None
+                ),
+
+                change_oi=pe.get(
+                    "change_oi"
+                ),
+
+                change_oi_percent=pe.get(
+                    "change_oi_percent"
+                ),
+
+                volume=pe.get(
+                    "volume"
+                )
+            )
 
         result.append({
 
@@ -752,6 +1205,43 @@ def build_strike_chain(
                 if ce else None
             ),
 
+            "ce_volume": (
+                ce.get("volume")
+                if ce else None
+            ),
+
+            "ce_activity": (
+                ce_intelligence.get(
+                    "activity"
+                )
+                if ce_intelligence
+                else None
+            ),
+
+            "ce_activity_direction": (
+                ce_intelligence.get(
+                    "direction"
+                )
+                if ce_intelligence
+                else None
+            ),
+
+            "ce_premium_change": (
+                ce_intelligence.get(
+                    "premium_change"
+                )
+                if ce_intelligence
+                else None
+            ),
+
+            "ce_oi_change_ratio": (
+                ce_intelligence.get(
+                    "oi_change_ratio"
+                )
+                if ce_intelligence
+                else None
+            ),
+
             "pe_oi": (
                 pe.get("oi")
                 if pe else None
@@ -765,6 +1255,43 @@ def build_strike_chain(
             "pe_ltp": (
                 pe.get("ltp")
                 if pe else None
+            ),
+
+            "pe_volume": (
+                pe.get("volume")
+                if pe else None
+            ),
+
+            "pe_activity": (
+                pe_intelligence.get(
+                    "activity"
+                )
+                if pe_intelligence
+                else None
+            ),
+
+            "pe_activity_direction": (
+                pe_intelligence.get(
+                    "direction"
+                )
+                if pe_intelligence
+                else None
+            ),
+
+            "pe_premium_change": (
+                pe_intelligence.get(
+                    "premium_change"
+                )
+                if pe_intelligence
+                else None
+            ),
+
+            "pe_oi_change_ratio": (
+                pe_intelligence.get(
+                    "oi_change_ratio"
+                )
+                if pe_intelligence
+                else None
             )
         })
 
@@ -886,6 +1413,37 @@ def calculate_pcr(
 
 
 # ============================================================
+# CHANGE OI PCR
+# FIXED
+#
+# Negative/zero denominator no longer creates nonsense PCR.
+# ============================================================
+
+def calculate_change_oi_pcr(
+    put_change_oi,
+    call_change_oi
+):
+
+    if (
+        put_change_oi is None
+        or
+        call_change_oi is None
+    ):
+
+        return None
+
+    if call_change_oi <= 0:
+
+        return None
+
+    return safe_float(
+        put_change_oi /
+        call_change_oi,
+        3
+    )
+
+
+# ============================================================
 # MAX PAIN
 # ============================================================
 
@@ -962,56 +1520,553 @@ def calculate_max_pain(
 
 # ============================================================
 # OI SUPPORT / RESISTANCE
+#
+# Resistance:
+#   Highest CE OI above/near spot
+#
+# Support:
+#   Highest PE OI below/near spot
 # ============================================================
 
 def calculate_oi_levels(
     calls,
-    puts
+    puts,
+    spot=None
 ):
 
-    top_calls = top_oi_rows(
-        calls,
-        5
-    )
+    valid_calls = [
+        row
+        for row in calls
+        if (
+            row.get("oi") is not None
+            and
+            row.get("oi") > 0
+        )
+    ]
 
-    top_puts = top_oi_rows(
-        puts,
-        5
-    )
+    valid_puts = [
+        row
+        for row in puts
+        if (
+            row.get("oi") is not None
+            and
+            row.get("oi") > 0
+        )
+    ]
 
-    oi_resistance = None
+    # --------------------------------------------------------
+    # If spot unavailable use largest OI
+    # --------------------------------------------------------
 
-    oi_support = None
+    if spot is None:
 
-    if top_calls:
-
-        oi_resistance = (
-            top_calls[0].get(
-                "strike"
-            )
+        top_calls = top_oi_rows(
+            valid_calls,
+            5
         )
 
-    if top_puts:
+        top_puts = top_oi_rows(
+            valid_puts,
+            5
+        )
 
-        oi_support = (
-            top_puts[0].get(
-                "strike"
-            )
+        return {
+
+            "oi_resistance":
+                (
+                    top_calls[0]["strike"]
+                    if top_calls
+                    else None
+                ),
+
+            "oi_support":
+                (
+                    top_puts[0]["strike"]
+                    if top_puts
+                    else None
+                ),
+
+            "top_call_oi": top_calls,
+
+            "top_put_oi": top_puts
+        }
+
+    # --------------------------------------------------------
+    # CE resistance candidates
+    # --------------------------------------------------------
+
+    call_candidates = [
+        row
+        for row in valid_calls
+        if row["strike"] >= spot
+    ]
+
+    call_candidates.sort(
+        key=lambda x: x["oi"],
+        reverse=True
+    )
+
+    # --------------------------------------------------------
+    # PE support candidates
+    # --------------------------------------------------------
+
+    put_candidates = [
+        row
+        for row in valid_puts
+        if row["strike"] <= spot
+    ]
+
+    put_candidates.sort(
+        key=lambda x: x["oi"],
+        reverse=True
+    )
+
+    # --------------------------------------------------------
+    # Fallback if one side has no strike
+    # --------------------------------------------------------
+
+    if not call_candidates:
+
+        call_candidates = sorted(
+            valid_calls,
+            key=lambda x: x["oi"],
+            reverse=True
+        )
+
+    if not put_candidates:
+
+        put_candidates = sorted(
+            valid_puts,
+            key=lambda x: x["oi"],
+            reverse=True
         )
 
     return {
 
-        "oi_resistance": safe_float(
-            oi_resistance
+        "oi_resistance": (
+            call_candidates[0]["strike"]
+            if call_candidates
+            else None
         ),
 
-        "oi_support": safe_float(
-            oi_support
+        "oi_support": (
+            put_candidates[0]["strike"]
+            if put_candidates
+            else None
         ),
 
-        "top_call_oi": top_calls,
+        "top_call_oi":
+            top_oi_rows(
+                valid_calls,
+                5
+            ),
 
-        "top_put_oi": top_puts
+        "top_put_oi":
+            top_oi_rows(
+                valid_puts,
+                5
+            )
+    }
+
+
+# ============================================================
+# OI AGGREGATE INTELLIGENCE
+# ============================================================
+
+def calculate_oi_intelligence(
+    chain,
+    calls,
+    puts,
+    spot=None
+):
+
+    call_buying = 0
+    call_writing = 0
+
+    put_buying = 0
+    put_writing = 0
+
+    call_short_covering = 0
+    put_short_covering = 0
+
+    call_unwinding = 0
+    put_unwinding = 0
+
+    bullish_points = 0
+    bearish_points = 0
+
+    reasons = []
+
+    # --------------------------------------------------------
+    # Strike-level intelligence
+    # --------------------------------------------------------
+
+    for row in chain:
+
+        ce_activity = row.get(
+            "ce_activity"
+        )
+
+        pe_activity = row.get(
+            "pe_activity"
+        )
+
+        # ----------------------------------------------------
+        # CE
+        # ----------------------------------------------------
+
+        if ce_activity == "CALL_BUYING":
+
+            call_buying += 1
+            bullish_points += 1
+
+        elif ce_activity == "CALL_WRITING":
+
+            call_writing += 1
+            bearish_points += 1
+
+        elif ce_activity == "CALL_SHORT_COVERING":
+
+            call_short_covering += 1
+            bullish_points += 1
+
+        elif ce_activity == "CALL_LONG_UNWINDING":
+
+            call_unwinding += 1
+            bearish_points += 1
+
+        # ----------------------------------------------------
+        # PE
+        # ----------------------------------------------------
+
+        if pe_activity == "PUT_BUYING":
+
+            put_buying += 1
+            bearish_points += 1
+
+        elif pe_activity == "PUT_WRITING":
+
+            put_writing += 1
+            bullish_points += 1
+
+        elif pe_activity == "PUT_SHORT_COVERING":
+
+            put_short_covering += 1
+            bearish_points += 1
+
+        elif pe_activity == "PUT_LONG_UNWINDING":
+
+            put_unwinding += 1
+            bullish_points += 1
+
+    # --------------------------------------------------------
+    # Weight by proximity to spot
+    #
+    # Near-ATM option activity gets greater influence.
+    # --------------------------------------------------------
+
+    weighted_bullish = 0.0
+    weighted_bearish = 0.0
+
+    if spot is not None:
+
+        for row in chain:
+
+            strike = row.get(
+                "strike"
+            )
+
+            if strike is None:
+                continue
+
+            distance = abs(
+                strike - spot
+            )
+
+            distance_ratio = (
+                distance /
+                max(
+                    spot,
+                    1.0
+                )
+            )
+
+            weight = max(
+                0.25,
+                1.0 -
+                distance_ratio * 20.0
+            )
+
+            ce_direction = row.get(
+                "ce_activity_direction"
+            )
+
+            pe_direction = row.get(
+                "pe_activity_direction"
+            )
+
+            if ce_direction == "BULLISH":
+
+                weighted_bullish += weight
+
+            elif ce_direction == "BEARISH":
+
+                weighted_bearish += weight
+
+            if pe_direction == "BULLISH":
+
+                weighted_bullish += weight
+
+            elif pe_direction == "BEARISH":
+
+                weighted_bearish += weight
+
+    else:
+
+        weighted_bullish = bullish_points
+        weighted_bearish = bearish_points
+
+    # --------------------------------------------------------
+    # Direct four-way dominance
+    # --------------------------------------------------------
+
+    bullish_structure = (
+        put_writing +
+        call_buying +
+        call_short_covering
+    )
+
+    bearish_structure = (
+        call_writing +
+        put_buying +
+        put_short_covering
+    )
+
+    # --------------------------------------------------------
+    # Score
+    # --------------------------------------------------------
+
+    raw_score = (
+        weighted_bullish -
+        weighted_bearish
+    )
+
+    structure_score = (
+        bullish_structure -
+        bearish_structure
+    )
+
+    # Blend
+    score = (
+        raw_score * 0.60 +
+        structure_score * 0.40
+    )
+
+    # Normalize to -10/+10
+    score = clamp(
+        score,
+        OI_SCORE_MIN,
+        OI_SCORE_MAX
+    )
+
+    score = safe_float(
+        score,
+        2
+    )
+
+    # --------------------------------------------------------
+    # Bias
+    # --------------------------------------------------------
+
+    if score >= 3.0:
+
+        bias = "BULLISH"
+
+    elif score <= -3.0:
+
+        bias = "BEARISH"
+
+    else:
+
+        bias = "NEUTRAL"
+
+    # --------------------------------------------------------
+    # Confidence
+    # --------------------------------------------------------
+
+    total_activity = (
+        call_buying +
+        call_writing +
+        put_buying +
+        put_writing +
+        call_short_covering +
+        put_short_covering +
+        call_unwinding +
+        put_unwinding
+    )
+
+    if total_activity > 0:
+
+        directional_strength = (
+            abs(
+                bullish_structure -
+                bearish_structure
+            )
+            /
+            total_activity
+        )
+
+    else:
+
+        directional_strength = 0.0
+
+    confidence = int(
+        round(
+            clamp(
+                (
+                    abs(score) / 10.0
+                    * 0.60
+                )
+                +
+                (
+                    directional_strength
+                    * 0.40
+                ),
+                0.0,
+                1.0
+            )
+            * 100
+        )
+    )
+
+    # --------------------------------------------------------
+    # Reasons
+    # --------------------------------------------------------
+
+    if call_buying > 0:
+
+        reasons.append(
+            f"{call_buying} strike(s) show "
+            "probable Call Buying."
+        )
+
+    if call_writing > 0:
+
+        reasons.append(
+            f"{call_writing} strike(s) show "
+            "probable Call Writing."
+        )
+
+    if put_buying > 0:
+
+        reasons.append(
+            f"{put_buying} strike(s) show "
+            "probable Put Buying."
+        )
+
+    if put_writing > 0:
+
+        reasons.append(
+            f"{put_writing} strike(s) show "
+            "probable Put Writing."
+        )
+
+    if call_short_covering > 0:
+
+        reasons.append(
+            f"{call_short_covering} strike(s) show "
+            "Call Short Covering."
+        )
+
+    if put_short_covering > 0:
+
+        reasons.append(
+            f"{put_short_covering} strike(s) show "
+            "Put Short Covering."
+        )
+
+    if not reasons:
+
+        reasons.append(
+            "No strong four-way OI activity confirmed yet."
+        )
+
+    # --------------------------------------------------------
+    # OI SHIFT
+    # --------------------------------------------------------
+
+    if bullish_structure >= (
+        bearish_structure + 2
+    ):
+
+        oi_shift = "PUT_SUPPORT_BUILDING"
+
+    elif bearish_structure >= (
+        bullish_structure + 2
+    ):
+
+        oi_shift = "CALL_RESISTANCE_BUILDING"
+
+    elif (
+        put_writing > call_writing
+        and
+        put_writing > put_buying
+    ):
+
+        oi_shift = "BULLISH_PUT_WRITING"
+
+    elif (
+        call_writing > put_writing
+        and
+        call_writing > call_buying
+    ):
+
+        oi_shift = "BEARISH_CALL_WRITING"
+
+    else:
+
+        oi_shift = "NO_CLEAR_SHIFT"
+
+    return {
+
+        "call_buying":
+            call_buying,
+
+        "call_writing":
+            call_writing,
+
+        "put_buying":
+            put_buying,
+
+        "put_writing":
+            put_writing,
+
+        "call_short_covering":
+            call_short_covering,
+
+        "put_short_covering":
+            put_short_covering,
+
+        "call_long_unwinding":
+            call_unwinding,
+
+        "put_long_unwinding":
+            put_unwinding,
+
+        "oi_shift":
+            oi_shift,
+
+        "oi_score":
+            score,
+
+        "oi_confidence":
+            confidence,
+
+        "oi_bias":
+            bias,
+
+        "oi_reasons":
+            reasons
     }
 
 
@@ -1041,7 +2096,7 @@ def calculate_oi_bias(
             score += 2
 
             reasons.append(
-                "PCR is bullish"
+                "PCR is bullish."
             )
 
         elif pcr <= 0.80:
@@ -1049,7 +2104,7 @@ def calculate_oi_bias(
             score -= 2
 
             reasons.append(
-                "PCR is bearish"
+                "PCR is bearish."
             )
 
         elif pcr > 1.0:
@@ -1057,7 +2112,7 @@ def calculate_oi_bias(
             score += 1
 
             reasons.append(
-                "PCR is mildly bullish"
+                "PCR is mildly bullish."
             )
 
         elif pcr < 1.0:
@@ -1065,7 +2120,7 @@ def calculate_oi_bias(
             score -= 1
 
             reasons.append(
-                "PCR is mildly bearish"
+                "PCR is mildly bearish."
             )
 
     # --------------------------------------------------------
@@ -1087,7 +2142,7 @@ def calculate_oi_bias(
             score += 2
 
             reasons.append(
-                "Put OI rising while Call OI is falling"
+                "Put OI rising while Call OI is falling."
             )
 
         elif (
@@ -1099,7 +2154,7 @@ def calculate_oi_bias(
             score -= 2
 
             reasons.append(
-                "Call OI rising while Put OI is falling"
+                "Call OI rising while Put OI is falling."
             )
 
         elif (
@@ -1109,7 +2164,7 @@ def calculate_oi_bias(
         ):
 
             reasons.append(
-                "Both Call and Put OI are rising"
+                "Both Call and Put OI are rising."
             )
 
     # --------------------------------------------------------
@@ -1127,7 +2182,7 @@ def calculate_oi_bias(
             score -= 1
 
     # --------------------------------------------------------
-    # FINAL BIAS
+    # FINAL
     # --------------------------------------------------------
 
     if score >= 3:
@@ -1153,7 +2208,68 @@ def calculate_oi_bias(
 
 
 # ============================================================
-# EMPTY / ERROR RESPONSE
+# UPDATE PREVIOUS SNAPSHOT
+# ============================================================
+
+def update_option_snapshots(
+    calls,
+    puts,
+    expiry
+):
+
+    for row in calls:
+
+        save_option_snapshot(
+
+            expiry=expiry,
+
+            option_type="CE",
+
+            strike=row.get(
+                "strike"
+            ),
+
+            ltp=row.get(
+                "ltp"
+            ),
+
+            oi=row.get(
+                "oi"
+            ),
+
+            volume=row.get(
+                "volume"
+            )
+        )
+
+    for row in puts:
+
+        save_option_snapshot(
+
+            expiry=expiry,
+
+            option_type="PE",
+
+            strike=row.get(
+                "strike"
+            ),
+
+            ltp=row.get(
+                "ltp"
+            ),
+
+            oi=row.get(
+                "oi"
+            ),
+
+            volume=row.get(
+                "volume"
+            )
+        )
+
+
+# ============================================================
+# EMPTY RESPONSE
 # ============================================================
 
 def empty_oi_response(
@@ -1202,10 +2318,20 @@ def empty_oi_response(
 
         "oi_score": 0,
 
+        "oi_confidence": 0,
+
+        "call_buying": 0,
+
+        "call_writing": 0,
+
+        "put_buying": 0,
+
+        "put_writing": 0,
+
+        "oi_shift": "UNKNOWN",
+
         "oi_reasons": [
-
             message
-
         ],
 
         "top_call_oi": [],
@@ -1214,7 +2340,8 @@ def empty_oi_response(
 
         "chain": [],
 
-        "timestamp": datetime.now().isoformat()
+        "timestamp":
+            datetime.now().isoformat()
     }
 
 
@@ -1323,7 +2450,17 @@ def get_oi_analysis(
             return response
 
         # ----------------------------------------------------
-        # BUILD CHAIN
+        # SPOT
+        # ----------------------------------------------------
+
+        spot_ltp = (
+            normalized
+            .get("spot", {})
+            .get("ltp")
+        )
+
+        # ----------------------------------------------------
+        # CHAIN
         # ----------------------------------------------------
 
         chain = build_strike_chain(
@@ -1359,7 +2496,7 @@ def get_oi_analysis(
             total_call_oi
         )
 
-        change_pcr = calculate_pcr(
+        change_pcr = calculate_change_oi_pcr(
             put_change_oi,
             call_change_oi
         )
@@ -1378,22 +2515,167 @@ def get_oi_analysis(
 
         levels = calculate_oi_levels(
             calls,
-            puts
+            puts,
+            spot_ltp
         )
 
         # ----------------------------------------------------
-        # BIAS
+        # BASIC OI BIAS
         # ----------------------------------------------------
 
-        bias = calculate_oi_bias(
+        basic_bias = calculate_oi_bias(
+
             pcr=pcr,
+
             change_pcr=change_pcr,
+
             call_change_oi=call_change_oi,
+
             put_change_oi=put_change_oi
         )
 
         # ----------------------------------------------------
-        # SUCCESS
+        # ADVANCED OI INTELLIGENCE
+        # ----------------------------------------------------
+
+        intelligence = calculate_oi_intelligence(
+
+            chain=chain,
+
+            calls=calls,
+
+            puts=puts,
+
+            spot=spot_ltp
+        )
+
+        # ----------------------------------------------------
+        # COMBINED SCORE
+        #
+        # Advanced four-way intelligence gets 70%.
+        # PCR/OI aggregate gets 30%.
+        # ----------------------------------------------------
+
+        advanced_score = (
+            intelligence.get(
+                "oi_score"
+            )
+            or 0
+        )
+
+        basic_score = (
+            basic_bias.get(
+                "score"
+            )
+            or 0
+        )
+
+        combined_score = (
+            advanced_score * 0.70
+            +
+            basic_score * 0.30
+        )
+
+        combined_score = safe_float(
+            clamp(
+                combined_score,
+                OI_SCORE_MIN,
+                OI_SCORE_MAX
+            ),
+            2
+        )
+
+        # ----------------------------------------------------
+        # FINAL OI BIAS
+        # ----------------------------------------------------
+
+        if combined_score >= 3.0:
+
+            final_bias = "BULLISH"
+
+        elif combined_score <= -3.0:
+
+            final_bias = "BEARISH"
+
+        else:
+
+            final_bias = "NEUTRAL"
+
+        # ----------------------------------------------------
+        # FINAL CONFIDENCE
+        # ----------------------------------------------------
+
+        advanced_confidence = (
+            intelligence.get(
+                "oi_confidence"
+            )
+            or 0
+        )
+
+        confidence = int(
+            round(
+                advanced_confidence * 0.70
+                +
+                min(
+                    abs(
+                        basic_score
+                    ) / 5.0,
+                    1.0
+                ) * 100 * 0.30
+            )
+        )
+
+        confidence = int(
+            clamp(
+                confidence,
+                0,
+                100
+            )
+        )
+
+        # ----------------------------------------------------
+        # COMBINED REASONS
+        # ----------------------------------------------------
+
+        combined_reasons = []
+
+        combined_reasons.extend(
+            intelligence.get(
+                "oi_reasons",
+                []
+            )
+        )
+
+        combined_reasons.extend(
+            basic_bias.get(
+                "reasons",
+                []
+            )
+        )
+
+        # Remove duplicates
+        combined_reasons = list(
+            dict.fromkeys(
+                combined_reasons
+            )
+        )
+
+        # ----------------------------------------------------
+        # UPDATE SNAPSHOT
+        #
+        # IMPORTANT:
+        # Do this AFTER intelligence calculation.
+        # Otherwise current LTP becomes previous LTP.
+        # ----------------------------------------------------
+
+        update_option_snapshots(
+            calls=calls,
+            puts=puts,
+            expiry=expiry
+        )
+
+        # ----------------------------------------------------
+        # SUCCESS RESPONSE
         # ----------------------------------------------------
 
         return {
@@ -1402,88 +2684,164 @@ def get_oi_analysis(
 
             "source": "Kotak Neo",
 
-            "underlying": KOTAK_UNDERLYING,
+            "underlying":
+                KOTAK_UNDERLYING,
 
-            "exchange": KOTAK_EXCHANGE,
+            "exchange":
+                KOTAK_EXCHANGE,
 
-            "expiry": expiry,
+            "expiry":
+                expiry,
 
-            "requested_expiry": raw.get(
-                "_requested_expiry",
-                requested_expiry
-            ),
+            "requested_expiry":
+                raw.get(
+                    "_requested_expiry",
+                    requested_expiry
+                ),
 
-            "actual_expiry": raw.get(
-                "_actual_expiry",
-                expiry
-            ),
+            "actual_expiry":
+                raw.get(
+                    "_actual_expiry",
+                    expiry
+                ),
 
-            "chain_attempt": raw.get(
-                "_chain_attempt",
-                "explicit_expiry"
-            ),
+            "chain_attempt":
+                raw.get(
+                    "_chain_attempt",
+                    "explicit_expiry"
+                ),
 
-            "lot_size": normalized[
-                "lot_size"
-            ],
+            "lot_size":
+                normalized[
+                    "lot_size"
+                ],
 
-            "multiplier": normalized[
-                "multiplier"
-            ],
+            "multiplier":
+                normalized[
+                    "multiplier"
+                ],
 
-            "spot": normalized[
-                "spot"
-            ],
+            "spot":
+                normalized[
+                    "spot"
+                ],
 
-            "future": normalized[
-                "future"
-            ],
+            "future":
+                normalized[
+                    "future"
+                ],
 
-            "total_call_oi": total_call_oi,
+            "total_call_oi":
+                total_call_oi,
 
-            "total_put_oi": total_put_oi,
+            "total_put_oi":
+                total_put_oi,
 
-            "call_change_oi": call_change_oi,
+            "call_change_oi":
+                call_change_oi,
 
-            "put_change_oi": put_change_oi,
+            "put_change_oi":
+                put_change_oi,
 
-            "pcr": pcr,
+            "pcr":
+                pcr,
 
-            "change_oi_pcr": change_pcr,
+            "change_oi_pcr":
+                change_pcr,
 
-            "max_pain": max_pain,
+            "max_pain":
+                max_pain,
 
-            "oi_support": levels[
-                "oi_support"
-            ],
+            "oi_support":
+                levels[
+                    "oi_support"
+                ],
 
-            "oi_resistance": levels[
-                "oi_resistance"
-            ],
+            "oi_resistance":
+                levels[
+                    "oi_resistance"
+                ],
 
-            "oi_bias": bias[
-                "bias"
-            ],
+            # ------------------------------------------------
+            # FINAL OI INTELLIGENCE
+            # ------------------------------------------------
 
-            "oi_score": bias[
-                "score"
-            ],
+            "oi_bias":
+                final_bias,
 
-            "oi_reasons": bias[
-                "reasons"
-            ],
+            "oi_score":
+                combined_score,
 
-            "top_call_oi": levels[
-                "top_call_oi"
-            ],
+            "oi_confidence":
+                confidence,
 
-            "top_put_oi": levels[
-                "top_put_oi"
-            ],
+            "oi_shift":
+                intelligence.get(
+                    "oi_shift"
+                ),
 
-            "chain": chain,
+            # ------------------------------------------------
+            # FOUR-WAY
+            # ------------------------------------------------
 
-            "timestamp": datetime.now().isoformat()
+            "call_buying":
+                intelligence.get(
+                    "call_buying"
+                ),
+
+            "call_writing":
+                intelligence.get(
+                    "call_writing"
+                ),
+
+            "put_buying":
+                intelligence.get(
+                    "put_buying"
+                ),
+
+            "put_writing":
+                intelligence.get(
+                    "put_writing"
+                ),
+
+            "call_short_covering":
+                intelligence.get(
+                    "call_short_covering"
+                ),
+
+            "put_short_covering":
+                intelligence.get(
+                    "put_short_covering"
+                ),
+
+            "call_long_unwinding":
+                intelligence.get(
+                    "call_long_unwinding"
+                ),
+
+            "put_long_unwinding":
+                intelligence.get(
+                    "put_long_unwinding"
+                ),
+
+            "oi_reasons":
+                combined_reasons,
+
+            "top_call_oi":
+                levels[
+                    "top_call_oi"
+                ],
+
+            "top_put_oi":
+                levels[
+                    "top_put_oi"
+                ],
+
+            "chain":
+                chain,
+
+            "timestamp":
+                datetime.now().isoformat()
         }
 
     except Exception as exc:
@@ -1494,19 +2852,23 @@ def get_oi_analysis(
 
             "source": "Kotak Neo",
 
-            "underlying": KOTAK_UNDERLYING,
+            "underlying":
+                KOTAK_UNDERLYING,
 
-            "exchange": KOTAK_EXCHANGE,
+            "exchange":
+                KOTAK_EXCHANGE,
 
-            "expiry": expiry,
+            "expiry":
+                expiry,
 
-            "requested_expiry": requested_expiry,
+            "requested_expiry":
+                requested_expiry,
 
-            "message": str(exc),
+            "message":
+                str(exc),
 
-            "error_type": str(
-                type(exc)
-            ),
+            "error_type":
+                str(type(exc)),
 
             "total_call_oi": 0,
 
@@ -1530,10 +2892,20 @@ def get_oi_analysis(
 
             "oi_score": 0,
 
+            "oi_confidence": 0,
+
+            "call_buying": 0,
+
+            "call_writing": 0,
+
+            "put_buying": 0,
+
+            "put_writing": 0,
+
+            "oi_shift": "UNKNOWN",
+
             "oi_reasons": [
-
                 "Kotak OI analysis failed."
-
             ],
 
             "top_call_oi": [],
@@ -1542,7 +2914,8 @@ def get_oi_analysis(
 
             "chain": [],
 
-            "timestamp": datetime.now().isoformat()
+            "timestamp":
+                datetime.now().isoformat()
         }
 
 
@@ -1558,15 +2931,24 @@ def kotak_status():
 
     return {
 
-        "provider": "Kotak Neo",
+        "provider":
+            "Kotak Neo",
 
-        "configured": bool(
-            consumer_key
-        ),
+        "configured":
+            bool(consumer_key),
 
-        "market_data": True,
+        "market_data":
+            True,
 
-        "option_chain": True,
+        "option_chain":
+            True,
 
-        "order_placement": False
-    }
+        "oi_intelligence":
+            True,
+
+        "four_way_analysis":
+            True,
+
+        "order_placement":
+            False
+            }
